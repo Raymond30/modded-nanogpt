@@ -177,17 +177,19 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, secon
     momentum = momentum_t.to(grad_chunk.dtype)
     beta2 = beta2_t.to(grad_chunk.dtype)
 
-    # 1. Update first and second momentum
-    momentum_buffer.lerp_(grad_chunk, 1 - momentum)
-    g = grad_chunk.lerp_(momentum_buffer, momentum)
+    is_tall = grad_chunk.size(-2) >= grad_chunk.size(-1)
 
-    is_tall = g.size(-2) > g.size(-1)
-    
-    # Second momentum is the Gram matrix of grad_chunk
+    # 0. Second momentum is the Gram matrix of grad_chunk; update before mutating grad_chunk
     if is_tall:
         gram_tmp = grad_chunk.mT @ grad_chunk
     else:
         gram_tmp = grad_chunk @ grad_chunk.mT
+
+    # 1. Update first and second momentum
+    momentum_buffer.lerp_(grad_chunk, 1 - momentum)
+    g = grad_chunk.lerp_(momentum_buffer, momentum)
+    
+
         
     second_momentum_buffer.lerp_(gram_tmp, 1 - beta2)
     
@@ -1623,7 +1625,9 @@ TRAINING_STAGES = [
 training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
 #training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
-def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
+_LEON_MOMENTUM_MAX = float(os.environ.get("LEON_MOMENTUM_MAX", "0.95"))
+
+def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=_LEON_MOMENTUM_MAX):
     # warmup phase: linearly increase momentum from min to max
     # cooldown phase: linearly decrease momentum from max to min
     momentum_cd_start = training_schedule.total_steps - muon_cooldown_steps
@@ -1689,7 +1693,7 @@ class TrainingManager():
 
         leon_defaults = dict(
             lr=float(os.environ.get("LEON_LR", "0.046")),
-            momentum=0.95,
+            momentum=_LEON_MOMENTUM_MAX,
             weight_decay=float(os.environ.get("LEON_WD", "0.6")),
             beta2=float(os.environ.get("LEON_BETA2", "0.8")),
         )
