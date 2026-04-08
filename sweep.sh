@@ -9,10 +9,10 @@
 # ==============================================================================
 
 # Search Space
-LEARNING_RATES=(0.023)
+LEARNING_RATES=(0.046)
 MOMENTUM_VALS=(0.95)
 BETA2_VALS=(0.4)
-WEIGHT_DECAYS=(1.2)
+WEIGHT_DECAYS=(0.3)
 
 TOTAL_RUNS=$(( ${#LEARNING_RATES[@]} * ${#MOMENTUM_VALS[@]} * ${#BETA2_VALS[@]} * ${#WEIGHT_DECAYS[@]} ))
 CURRENT_RUN=1

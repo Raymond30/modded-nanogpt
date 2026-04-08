@@ -21,6 +21,7 @@ import gc
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+torch.set_float32_matmul_precision("high")
 import triton
 import numpy as np
 
@@ -181,15 +182,17 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, secon
 
     # 0. Second momentum is the Gram matrix of grad_chunk; update before mutating grad_chunk
     if is_tall:
-        gram_tmp = grad_chunk.mT @ grad_chunk
+        gram_tmp = torch.empty((*grad_chunk.shape[:-2], grad_chunk.size(-1), grad_chunk.size(-1)), device=grad_chunk.device, dtype=grad_chunk.dtype)
+        # gram_tmp = grad_chunk.mT @ grad_chunk
+        XTX(grad_chunk, gram_tmp)
     else:
-        gram_tmp = grad_chunk @ grad_chunk.mT
+        # gram_tmp = grad_chunk @ grad_chunk.mT
+        gram_tmp = torch.empty((*grad_chunk.shape[:-1], grad_chunk.size(-2)), device=grad_chunk.device, dtype=grad_chunk.dtype)
+        XXT(grad_chunk, gram_tmp)
 
     # 1. Update first and second momentum
     momentum_buffer.lerp_(grad_chunk, 1 - momentum)
     g = grad_chunk.lerp_(momentum_buffer, momentum)
-    
-
         
     second_momentum_buffer.lerp_(gram_tmp, 1 - beta2)
     
@@ -201,48 +204,134 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, secon
     
     # Scale so that tr(GG^T + L) \approx 1
     tr = X.float().pow(2).sum(dim=(-2, -1), keepdim=True) + A.diagonal(dim1=-2, dim2=-1).sum(dim=-1, keepdim=True).unsqueeze(-1)
-    # the 1.1**2 factor acts as a safety cushion for the iterations
-    tr = tr.clamp_min(1e-12) * (1.1**2)
+    # the 1.02**2 factor acts as a safety cushion for the iterations
+    tr = tr.clamp_min(1e-12) * ((1 + 2e-2)**2)
 
     inv_sqrt_tr = tr.rsqrt()
     inv_tr = inv_sqrt_tr.square()
 
     X = X * inv_sqrt_tr.to(X.dtype)
     A = (A * inv_tr).contiguous()
-    
-    # Initial Gram matrix A0 = GG^T + L
-    if is_tall:
-        A = (X.float().mT @ X.float()) + A
-    else:
-        A = (X.float() @ X.float().mT) + A
-        
-    A.diagonal(dim1=-2, dim2=-1).add_(1e-10) # eps for stability
+    last_iter = len(polar_express_coeffs) - 1
 
-    # Select batched vs unbatched for X update
-    if split_baddbmm:
-        XB_matmul = torch.bmm if X.ndim > 2 else torch.mm
-    else:
-        XB_matmul = torch.baddbmm if X.ndim > 2 else torch.addmm
-        
-    # Perform the NS iterations
-    for a, b, c in polar_express_coeffs:
-        A = 0.5 * (A + A.transpose(-2, -1))  # keep symmetric
-        
-        # We can use the triton kernel ba_plus_cAA for the B computation!
-        # wait, ba_plus_cAA only supports bfloat16 currently in the codebase, 
-        # A here is float32 to prevent numerical issues, so we do it in PyTorch:
-        B = b * A + c * (A @ A)
-        
-        if is_tall: # A is right multiplied
-            X = a * X + (X @ B.to(X.dtype))
-        else: # A is left multiplied
-            X = a * X + (B.to(X.dtype) @ X)
+    if is_tall:
+        # Tall: use Triton kernels with X^T @ X (small) and right multiplication
+        gram_tmp = torch.empty((*X.shape[:-2], X.size(-1), X.size(-1)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
+        D = torch.empty_like(A)
             
-        # A <- (aI + B) A (aI + B)
-        # computed sequentially: A = a^2 A + a(BA + AB) + B A B
-        BA = B @ A
-        A = a * A + BA
-        A = a * A + A @ B
+        # Initial Gram matrix A0 = GG^T + L
+        XTX(X, gram_tmp)
+        A.add_(gram_tmp)
+        B_X = gram_tmp  # Reuse the BF16 Gram workspace for the X update path.
+        A.diagonal(dim1=-2, dim2=-1).add_(1e-10) # eps for stability
+        # Select batched vs unbatched for X update
+        if split_baddbmm:
+            XB_matmul = torch.bmm if X.ndim > 2 else torch.mm
+        else:
+            aX_plus_XB = torch.baddbmm if X.ndim > 2 else torch.addmm
+        
+        aA_plus_BA = torch.baddbmm if X.ndim > 2 else torch.addmm
+        aA_plus_AB = torch.baddbmm if X.ndim > 2 else torch.addmm
+        # Perform the NS iterations
+        for i, (a, b, c) in enumerate(polar_express_coeffs):
+            A = 0.5 * (A + A.transpose(-2, -1))  # keep symmetric
+            
+            # Keep B in FP32 for the small-matrix A update, and cast a copy to X.dtype
+            # for the large X update to avoid mixed-dtype matmuls.
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)
+            B_X.copy_(B)
+
+            # Referencing X twice causes pytorch to make a defensive copy,
+            # resulting in a cudaMemcpyAsync in baddbmm.
+            # For large matrices (i.e., the mlp weights), it's faster to split
+            # the operation into two kernels to avoid this.
+            if split_baddbmm:
+                XB_matmul(X, B_X, out=C)  # C = X @ B
+                C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
+            else:
+                aX_plus_XB(X, X, B_X, beta=a, out=C)  # C = a * X + X @ B
+            
+            X, C = C, X  # Swap references to avoid unnecessary copies
+
+            # Skip update for the last iteration
+            if i < last_iter:
+                # A <- (aI + B) A (aI + B)
+                # computed sequentially: A = a^2 A + a(BA + AB) + B A B
+                aA_plus_BA(A, B, A, beta=a, out=D) # BA = a * A + B @ A
+                A, D = D, A # Swap references to avoid unnecessary copies
+                aA_plus_AB(A, A, B, beta=a, out=D) # A = a * A + A @ B
+                A, D = D, A # Swap references to avoid unnecessary copies
+    else:
+        # Wide: use Triton kernels with X @ X^T (small) and left multiplication
+        gram_tmp = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
+        D = torch.empty_like(A)
+
+        # Initial Gram matrix A0 = GG^T + L
+        XXT(X, gram_tmp)
+        A.add_(gram_tmp)
+        B_X = gram_tmp  # Reuse the BF16 Gram workspace for the X update path.
+        A.diagonal(dim1=-2, dim2=-1).add_(1e-10) # eps for stability
+
+        # Select batched vs unbatched for X update
+        if split_baddbmm:
+            BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
+        else:
+            aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+        aA_plus_BA = torch.baddbmm if X.ndim > 2 else torch.addmm
+        aA_plus_AB = torch.baddbmm if X.ndim > 2 else torch.addmm
+        # Perform the NS iterations
+        for i, (a, b, c) in enumerate(polar_express_coeffs):
+            A = 0.5 * (A + A.transpose(-2, -1))  # keep symmetric
+
+            # Keep B in FP32 for the small-matrix A update, and cast a copy to X.dtype
+            # for the large X update to avoid mixed-dtype matmuls.
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)
+            B_X.copy_(B)
+
+            if split_baddbmm:
+                BX_matmul(B_X, X, out=C)  # C = B @ X
+                C.add_(X, alpha=a)        # C = C + a*X  (in-place, X only read)
+            else:
+                aX_plus_BX(X, B_X, X, beta=a, out=C)  # C = a * X + B @ X
+
+            X, C = C, X  # Swap references to avoid unnecessary copies
+
+            # Skip update for the last iteration
+            if i < last_iter:
+                # A <- (aI + B) A (aI + B)
+                # computed sequentially: A = a^2 A + a(BA + AB) + B A B
+                aA_plus_BA(A, B, A, beta=a, out=D)  # BA = a * A + B @ A
+                A, D = D, A  # Swap references to avoid unnecessary copies
+                aA_plus_AB(A, A, B, beta=a, out=D)  # A = a * A + A @ B
+                A, D = D, A  # Swap references to avoid unnecessary copies
+
+
+
+        
+    # # Perform the NS iterations
+    # for a, b, c in polar_express_coeffs:
+    #     A = 0.5 * (A + A.transpose(-2, -1))  # keep symmetric
+        
+    #     # We can use the triton kernel ba_plus_cAA for the B computation!
+    #     # wait, ba_plus_cAA only supports bfloat16 currently in the codebase, 
+    #     # A here is float32 to prevent numerical issues, so we do it in PyTorch:
+    #     B = b * A + c * (A @ A)
+        
+    #     if is_tall: # A is right multiplied
+    #         X = a * X + (X @ B.to(X.dtype))
+    #     else: # A is left multiplied
+    #         X = a * X + (B.to(X.dtype) @ X)
+            
+    #     # A <- (aI + B) A (aI + B)
+    #     # computed sequentially: A = a^2 A + a(BA + AB) + B A B
+    #     BA = B @ A
+    #     A = a * A + BA
+    #     A = a * A + A @ B
         
     return X
 
