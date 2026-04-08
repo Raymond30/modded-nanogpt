@@ -191,8 +191,8 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, secon
         XXT(grad_chunk, gram_tmp)
 
     # 1. Update first and second momentum
-    momentum_buffer.lerp_(grad_chunk, 1 - momentum)
-    g = grad_chunk.lerp_(momentum_buffer, momentum)
+    momentum_buffer.lerp_(grad_chunk, 1 - momentum) # M_t = momentum * M_{t-1} + (1 - momentum) * G_t
+    g = grad_chunk.lerp_(momentum_buffer, momentum) # (1-momentum) * G_t + momentum * M_t  (in-place, using grad_chunk's storage for the output)
         
     second_momentum_buffer.lerp_(gram_tmp, 1 - beta2)
     
@@ -221,7 +221,7 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, secon
         C = torch.empty_like(X)
         D = torch.empty_like(A)
             
-        # Initial Gram matrix A0 = GG^T + L
+        # Initial Gram matrix A0 = G^T G + L
         XTX(X, gram_tmp)
         A.add_(gram_tmp)
         B_X = gram_tmp  # Reuse the BF16 Gram workspace for the X update path.
@@ -240,7 +240,7 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, secon
             
             # Keep B in FP32 for the small-matrix A update, and cast a copy to X.dtype
             # for the large X update to avoid mixed-dtype matmuls.
-            ba_plus_cAA(A, alpha=c, beta=b, out=B)
+            ba_plus_cAA(A, alpha=c, beta=b, out=B) # B = b * A + c * (A @ A)
             B_X.copy_(B)
 
             # Referencing X twice causes pytorch to make a defensive copy,
@@ -259,7 +259,7 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, secon
             if i < last_iter:
                 # A <- (aI + B) A (aI + B)
                 # computed sequentially: A = a^2 A + a(BA + AB) + B A B
-                aA_plus_BA(A, B, A, beta=a, out=D) # BA = a * A + B @ A
+                aA_plus_BA(A, B, A, beta=a, out=D) # A = a * A + B @ A
                 A, D = D, A # Swap references to avoid unnecessary copies
                 aA_plus_AB(A, A, B, beta=a, out=D) # A = a * A + A @ B
                 A, D = D, A # Swap references to avoid unnecessary copies
@@ -943,7 +943,7 @@ class LeonAndAdam:
         p_slice.add_(other=update, alpha=-1.0)
 
     # -----------------------------------
-    # Muon update
+    # Leon update
 
     def _leon_update(self, param: nn.Parameter, grad_chunk: Tensor, p_cfg: ParamConfig, rank: int) -> Tensor:
         """Apply Leon update to a parameter. Returns the updated p_slice."""
