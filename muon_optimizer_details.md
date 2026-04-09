@@ -157,9 +157,22 @@ if p_cfg.optim == "leon":
 
 ## 9. Combined Schedule Visualization
 
-The chart below overlays both schedules across the full training run (1390 scheduled + 110 extension steps). Stage background bands correspond to the batch-size curriculum.
+The left chart overlays the LR and momentum schedules across the full training run (`1450` scheduled + `40` extension steps). The right chart makes the batch-size curriculum explicit using the exact `TrainingSchedule` stage boundaries (`0-483`, `483-967`, `967-1450`, `1450-1490`).
 
-![LR and Momentum Schedule](./lr_momentum_schedule.png)
+<table>
+  <tr>
+    <td width="68%">
+      <img src="./lr_momentum_schedule.png" alt="LR and Momentum Schedule" width="100%">
+    </td>
+    <td width="32%">
+      <img src="./batch_size_schedule.svg" alt="Batch Size Schedule" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><em>Learning-rate and momentum schedules</em></td>
+    <td align="center"><em>Batch-size curriculum</em></td>
+  </tr>
+</table>
 
 ---
 
