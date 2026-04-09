@@ -921,7 +921,7 @@ class LeonAndAdam:
 
         bias1, bias2 = 1 - beta1 ** t, 1 - beta2 ** t
         self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
-        self._eff_wd_t.fill_(lr * lr * p_cfg.weight_decay * p_cfg.wd_mul)
+        self._eff_wd_t.fill_(lr * p_cfg.weight_decay * p_cfg.wd_mul)
 
         LeonAndAdam._adam_update_step(
             p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
@@ -955,7 +955,7 @@ class LeonAndAdam:
         self._momentum_t.fill_(p_cfg.momentum)
         self._beta2_t.fill_(p_cfg.beta2)
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
-        self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
+        self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay)
 
         # Fused Nesterov momentum + Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
@@ -973,7 +973,7 @@ class LeonAndAdam:
         if p_cfg.per_matrix_lr_mul is not None:
             for mat_idx in range(p_cfg.chunk_size):
                 self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.per_matrix_lr_mul[mat_idx] * p_cfg.lr)
-                self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
+                self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay)
                 LeonAndAdam._cautious_wd_and_update_inplace(
                     p_slice[mat_idx].view(torch.uint16), p_state["mantissa"][mat_idx], v_chunk[mat_idx],
                     self._eff_wd_t, self._eff_lr_t
