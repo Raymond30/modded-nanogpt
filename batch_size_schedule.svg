@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="420" viewBox="0 0 560 420" role="img" aria-labelledby="title desc">
+  <title id="title">Batch Size Schedule</title>
+  <desc id="desc">Stepwise batch size schedule across the 1490-step Leon and Muon training run.</desc>
+
+  <rect x="0" y="0" width="560" height="420" fill="#ffffff"/>
+
+  <text x="280" y="28" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="700" text-anchor="middle" fill="#1f2937">
+    Batch Size Schedule
+  </text>
+  <text x="280" y="48" font-family="Arial, Helvetica, sans-serif" font-size="11" text-anchor="middle" fill="#6b7280">
+    TrainingSchedule stage boundaries from train_gpt_leon.py / train_gpt_muon.py
+  </text>
+
+  <rect x="70" y="60" width="129.66" height="280" fill="#dbeafe" opacity="0.55"/>
+  <rect x="199.66" y="60" width="129.93" height="280" fill="#dcfce7" opacity="0.55"/>
+  <rect x="329.59" y="60" width="129.66" height="280" fill="#fde68a" opacity="0.55"/>
+  <rect x="459.25" y="60" width="10.75" height="280" fill="#fbcfe8" opacity="0.70"/>
+
+  <line x1="70" y1="60" x2="70" y2="340" stroke="#111827" stroke-width="1.5"/>
+  <line x1="70" y1="340" x2="470" y2="340" stroke="#111827" stroke-width="1.5"/>
+
+  <line x1="70" y1="340" x2="470" y2="340" stroke="#d1d5db" stroke-width="1"/>
+  <line x1="70" y1="230" x2="470" y2="230" stroke="#d1d5db" stroke-width="1"/>
+  <line x1="70" y1="120" x2="470" y2="120" stroke="#d1d5db" stroke-width="1"/>
+
+  <line x1="199.66" y1="60" x2="199.66" y2="340" stroke="#9ca3af" stroke-width="1" stroke-dasharray="5 5"/>
+  <line x1="329.59" y1="60" x2="329.59" y2="340" stroke="#9ca3af" stroke-width="1" stroke-dasharray="5 5"/>
+  <line x1="459.25" y1="60" x2="459.25" y2="340" stroke="#9ca3af" stroke-width="1" stroke-dasharray="5 5"/>
+
+  <polyline
+    fill="none"
+    stroke="#2563eb"
+    stroke-width="4"
+    stroke-linejoin="round"
+    stroke-linecap="round"
+    points="70,340 199.66,340 199.66,230 329.59,230 329.59,120 470,120"
+  />
+
+  <circle cx="70" cy="340" r="4.5" fill="#2563eb"/>
+  <circle cx="199.66" cy="340" r="4.5" fill="#2563eb"/>
+  <circle cx="199.66" cy="230" r="4.5" fill="#2563eb"/>
+  <circle cx="329.59" cy="230" r="4.5" fill="#2563eb"/>
+  <circle cx="329.59" cy="120" r="4.5" fill="#2563eb"/>
+  <circle cx="470" cy="120" r="4.5" fill="#2563eb"/>
+
+  <text x="56" y="344" font-family="Arial, Helvetica, sans-serif" font-size="12" text-anchor="end" fill="#374151">8</text>
+  <text x="56" y="234" font-family="Arial, Helvetica, sans-serif" font-size="12" text-anchor="end" fill="#374151">16</text>
+  <text x="56" y="124" font-family="Arial, Helvetica, sans-serif" font-size="12" text-anchor="end" fill="#374151">24</text>
+
+  <text x="70" y="360" font-family="Arial, Helvetica, sans-serif" font-size="11" text-anchor="middle" fill="#374151">0</text>
+  <text x="199.66" y="360" font-family="Arial, Helvetica, sans-serif" font-size="11" text-anchor="middle" fill="#374151">483</text>
+  <text x="329.59" y="360" font-family="Arial, Helvetica, sans-serif" font-size="11" text-anchor="middle" fill="#374151">967</text>
+  <text x="459.25" y="360" font-family="Arial, Helvetica, sans-serif" font-size="11" text-anchor="middle" fill="#374151">1450</text>
+  <text x="470" y="360" font-family="Arial, Helvetica, sans-serif" font-size="11" text-anchor="middle" fill="#374151">1490</text>
+
+  <text x="18" y="200" font-family="Arial, Helvetica, sans-serif" font-size="12" text-anchor="middle" fill="#374151" transform="rotate(-90 18 200)">
+    Batch multiplier blocks
+  </text>
+  <text x="270" y="392" font-family="Arial, Helvetica, sans-serif" font-size="12" text-anchor="middle" fill="#374151">
+    Training step
+  </text>
+
+  <text x="135" y="86" font-family="Arial, Helvetica, sans-serif" font-size="11" font-weight="700" text-anchor="middle" fill="#1f2937">Stage 1</text>
+  <text x="265" y="86" font-family="Arial, Helvetica, sans-serif" font-size="11" font-weight="700" text-anchor="middle" fill="#1f2937">Stage 2</text>
+  <text x="394" y="86" font-family="Arial, Helvetica, sans-serif" font-size="11" font-weight="700" text-anchor="middle" fill="#1f2937">Stage 3</text>
+  <text x="464.5" y="86" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="700" text-anchor="middle" fill="#1f2937">Ext.</text>
+
+  <text x="132" y="326" font-family="Arial, Helvetica, sans-serif" font-size="11" text-anchor="middle" fill="#1e3a8a">8 x 2048 x 8</text>
+  <text x="265" y="216" font-family="Arial, Helvetica, sans-serif" font-size="11" text-anchor="middle" fill="#166534">16 x 2048 x 8</text>
+  <text x="394" y="106" font-family="Arial, Helvetica, sans-serif" font-size="11" text-anchor="middle" fill="#92400e">24 x 2048 x 8</text>
+
+  <text x="458" y="74" font-family="Arial, Helvetica, sans-serif" font-size="10" text-anchor="end" fill="#6b7280">
+    Extension keeps the 24-block batch
+  </text>
+</svg>
