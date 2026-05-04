@@ -10,9 +10,144 @@ import os
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
+import argparse
+import ast
+import json
+import subprocess
 import uuid
 import time
+from datetime import datetime
 from pathlib import Path
+
+
+BASE_HPARAMS = dict(
+    # Training
+    train_steps         = 3375,
+    # AdamW — embedding
+    embed_lr            = 0.3,
+    # AdamW — lm_head projection
+    proj_lr             = 1/320,
+    # AdamW — scalars (biases, gains)
+    scalar_lr           = 0.01,
+    # AdamW shared
+    adam_betas          = (0.8, 0.95),
+    adam_eps            = 1e-10,
+    adam_wd             = 0.0,
+    adam_cooldown_frac  = 0.7,
+    # Leon — 2D block params
+    leon_lr             = 0.025,
+    leon_wd             = 0.025,
+    leon_mu             = 0.95,
+    leon_beta2          = 0.7,
+    leon_cooldown_frac  = 0.7,
+    leon_ns_iters       = 6,
+    leon_eps            = 1e-7,
+)
+
+
+def parse_value(s: str):
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError):
+        return s
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("legacy_trials", nargs="?", type=int,
+                        help="Legacy positional trial count. Prefer --trials.")
+    parser.add_argument("--trials", type=int, default=None)
+    parser.add_argument("--set", action="append", default=[],
+                        metavar="KEY=VALUE", help="Override or add an hparams entry.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Resolve config and write metadata without CUDA/NCCL/training.")
+    parser.add_argument("--out-dir", type=Path, default=None,
+                        help="Run output directory. Defaults to runs/leon/<timestamp>-<uuid>.")
+    return parser.parse_args()
+
+
+def resolve_hparams(overrides):
+    hparams = dict(BASE_HPARAMS)
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"--set expects KEY=VALUE, got {item!r}")
+        key, raw_value = item.split("=", 1)
+        value = parse_value(raw_value)
+        if key == "cooldown_frac":
+            hparams["adam_cooldown_frac"] = value
+            hparams["leon_cooldown_frac"] = value
+        hparams[key] = value
+    return hparams
+
+
+def config_diff(hparams):
+    return {k: v for k, v in hparams.items() if BASE_HPARAMS.get(k) != v}
+
+
+def default_run_dir():
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path("records/track_3_optimization/runs/leon") / f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def create_run_dir(out_dir=None):
+    run_dir = Path(out_dir) if out_dir is not None else default_run_dir()
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def git_commit():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return None
+
+
+def shard_counts():
+    cwd = Path.cwd()
+    return dict(
+        train_shards=len(list(cwd.glob("data/fineweb10B/fineweb_train_*.bin"))),
+        val_shards=len(list(cwd.glob("data/fineweb10B/fineweb_val_*.bin"))),
+    )
+
+
+def torch_versions():
+    torch_module = globals().get("torch")
+    if torch_module is None:
+        return None, None
+    return torch_module.version.__version__, torch_module.version.cuda
+
+
+def write_run_files(run_dir, args, hparams, mode, extra=None):
+    torch_version, cuda_version = torch_versions()
+    diff = config_diff(hparams)
+    metadata = dict(
+        mode=mode,
+        argv=sys.argv,
+        cwd=str(Path.cwd()),
+        script=sys.argv[0],
+        trials=args.trials if args.trials is not None else (args.legacy_trials or 1),
+        dry_run=args.dry_run,
+        out_dir=str(run_dir),
+        git_commit=git_commit(),
+        torch_version=torch_version,
+        cuda_version=cuda_version,
+        shard_counts=shard_counts(),
+    )
+    if extra:
+        metadata.update(extra)
+    (run_dir / "config.json").write_text(json.dumps(hparams, indent=2, sort_keys=True) + "\n")
+    (run_dir / "config_diff.json").write_text(json.dumps(diff, indent=2, sort_keys=True) + "\n")
+    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+
+
+if "--dry-run" in sys.argv:
+    args = parse_args()
+    hparams = resolve_hparams(args.set)
+    run_dir = create_run_dir(args.out_dir)
+    write_run_files(run_dir, args, hparams, "dry-run")
+    print(f"dry_run:true out_dir:{run_dir}")
+    print(json.dumps(dict(hparams=hparams, config_diff=config_diff(hparams)), indent=2, sort_keys=True))
+    sys.exit(0)
 
 import torch
 from torch import Tensor, nn
@@ -163,7 +298,8 @@ class GPT(nn.Module):
 
 def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_buffer: Tensor,
                        momentum: float = 0.95, beta2: float = 0.7,
-                       ns_iters: int = 6, ns_coeffs: tuple = (2, -1.5, 0.5)) -> Tensor:
+                       ns_iters: int = 6, ns_coeffs: tuple = (2, -1.5, 0.5),
+                       eps: float = 1e-7) -> Tensor:
     """
     Leon update: Nesterov momentum + Newton-Schulz orthogonalization with
     augmented Gram matrix (second momentum buffer).
@@ -179,6 +315,7 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
         beta2: Second momentum coefficient (Gram EMA)
         ns_iters: Number of Newton-Schulz iterations
         ns_coeffs: (a, b, c) coefficients for the NS iteration
+        eps: Diagonal stability epsilon added to the augmented Gram matrix
     """
     is_tall = grad.size(-2) >= grad.size(-1)
 
@@ -215,7 +352,7 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
         A = A + (X.mT @ X)
     else:
         A = A + (X @ X.mT)
-    A.diagonal(dim1=-2, dim2=-1).add_(1e-7)  # eps for stability
+    A.diagonal(dim1=-2, dim2=-1).add_(eps)  # eps for stability
 
     # 5. Newton-Schulz iterations with A iteration
     a, b, c = ns_coeffs
@@ -248,10 +385,12 @@ class Leon(torch.optim.Optimizer):
     a second momentum buffer L (EMA of gradient Gram matrices) and augments
     the iteration matrix: A = X@X^T + L. A is also iterated alongside X.
     """
-    def __init__(self, params, lr=0.025, weight_decay=0.025, mu=0.95, beta2=0.7):
+    def __init__(self, params, lr=0.025, weight_decay=0.025, mu=0.95, beta2=0.7,
+                 ns_iters=6, eps=1e-7):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
-        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, beta2=beta2)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, beta2=beta2,
+                        ns_iters=ns_iters, eps=eps)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -276,6 +415,7 @@ class Leon(torch.optim.Optimizer):
                     update = leon_orthogonalize(
                         grad, state["momentum_buffer"], state["second_momentum_buffer"],
                         momentum=group["mu"], beta2=group["beta2"],
+                        ns_iters=group["ns_iters"], eps=group["eps"],
                     )
                     update *= max(1, p.size(-2) / p.size(-1))**0.5
                     p.mul_(1 - group["lr"] * group["weight_decay"])
@@ -287,178 +427,190 @@ class Leon(torch.optim.Optimizer):
 #                Setup                 #
 ########################################
 
-# torchrun sets these env variables
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
-dist.barrier()
-# this code can be run equivalently with 1, 2, 4, or 8 gpus.
-assert 8 % dist.get_world_size() == 0
+def main():
+    args = parse_args()
+    num_trials = args.trials if args.trials is not None else (args.legacy_trials or 1)
+    hparams = resolve_hparams(args.set)
 
-# logging setup
-if dist.get_rank() == 0:
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{uuid.uuid4()}.txt"
-    print(logfile)
-def print0(s, console=False, log=True):
-    if dist.get_rank() == 0:
-        if console:
-            print(s)
-        if log:
-            with open(logfile, "a") as f:
-                print(s, file=f)
+    if args.dry_run:
+        run_dir = create_run_dir(args.out_dir)
+        write_run_files(run_dir, args, hparams, "dry-run")
+        print(f"dry_run:true out_dir:{run_dir}")
+        print(json.dumps(dict(hparams=hparams, config_diff=config_diff(hparams)), indent=2, sort_keys=True))
+        return
 
-# we begin by logging this file itself
-print0(code)
-print0("="*100)
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
-       + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
-print0("="*100)
-
-val_tokens = 20 * 524288
-batch_size = 8 * 64 * 1024
-mbs = 64
-val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
-
-model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
-model.compile(dynamic=False)
-
-
-num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
-
-for _ in range(num_trials):
-
-
-    ########################################
-    #            Hyperparameters            #
-    ########################################
-
-    hparams = dict(
-        # Training
-        train_steps       = 3375,
-        cooldown_frac     = 0.7,
-        # AdamW — embedding
-        embed_lr          = 0.3,
-        # AdamW — lm_head projection
-        proj_lr           = 1/320,
-        # AdamW — scalars (biases, gains)
-        scalar_lr         = 0.01,
-        # AdamW shared
-        adam_betas         = (0.8, 0.95),
-        adam_eps           = 1e-10,
-        adam_wd            = 0.0,
-        # Leon — 2D block params
-        leon_lr           = 0.025,
-        leon_wd           = 0.025,
-        leon_mu           = 0.95,
-        leon_beta2        = 0.7,
-    )
-
-    train_steps = hparams["train_steps"]
-
-    # initialize model parameters
-    for name, p in model.named_parameters():
-        w = p.data
-        if name.endswith("weight"):
-            if "proj" in name:
-                w.zero_()
-            elif "embed" in name:
-                w.normal_()  # default torch init
-            else:
-                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
-        elif name.endswith("bias"):
-            w.zero_()
-        elif name.endswith("gains"):
-            w.normal_(mean=1, std=0)
-        else:
-            raise Exception(f"Uninitialized parameter: {name}")
-
-    # create the optimizer(s)
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=hparams["embed_lr"]),
-                        dict(params=[model.proj.weight], lr=hparams["proj_lr"]),
-                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=hparams["scalar_lr"])],
-                       betas=hparams["adam_betas"], eps=hparams["adam_eps"],
-                       weight_decay=hparams["adam_wd"], fused=True)
-    optimizer2 = Leon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=hparams["leon_lr"], weight_decay=hparams["leon_wd"],
-                      mu=hparams["leon_mu"], beta2=hparams["leon_beta2"])
-    optimizers = [optimizer1, optimizer2]
-    assert set(p for opt in optimizers for group in opt.param_groups
-               for p in group["params"]) == set(model.parameters())
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["initial_lr"] = group["lr"]
-
-    # learning rate schedule: stable then decay
-    cooldown_frac = hparams["cooldown_frac"]
-    def set_hparams(step):
-        progress = step / train_steps
-        assert 0 <= progress < 1
-        if progress < 1 - cooldown_frac:
-            eta = 1.0
-        else:
-            eta = (1 - progress) / cooldown_frac
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * eta
-
-
-    ########################################
-    #        Training and Validation       #
-    ########################################
-
-    train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
-    for p in model.parameters():
-        dist.broadcast(p.detach(), 0)
-    # start the clock
-    training_time = 0
-    last_val_step = 0
+    global device
+    # torchrun sets these env variables
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
     dist.barrier()
-    t0 = time.perf_counter()
-    for step in range(train_steps + 1):
+    # this code can be run equivalently with 1, 2, 4, or 8 gpus.
+    assert 8 % dist.get_world_size() == 0
 
-        # --------------- VALIDATION SECTION -----------------
-        if step == train_steps or step % 125 == 0:
-            # stop the clock
-            dist.barrier()
-            time_since_last_val = time.perf_counter() - t0
-            step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
-            last_val_step = step
-            training_time += time_since_last_val
-            model.eval()
-            val_loss = 0
-            with torch.no_grad():
-                assert len(val_inputs) % mbs == 0
-                for i in range(len(val_inputs) // mbs):
-                    val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
-            dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
-            val_loss /= val_tokens
-            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
-                   + f" step_avg:{1000*step_avg:.2f}ms", console=True)
-            model.train()
-            # start the clock again
+    try:
+        if dist.get_rank() == 0:
+            run_dir = create_run_dir(args.out_dir)
+        else:
+            run_dir = None
+        run_dir_obj = [str(run_dir) if run_dir is not None else None]
+        dist.broadcast_object_list(run_dir_obj, src=0)
+        run_dir = Path(run_dir_obj[0])
+        logfile = run_dir / "train.log"
+
+        # logging setup
+        if dist.get_rank() == 0:
+            print(logfile)
+            write_run_files(run_dir, args, hparams, "train", dict(
+                device_name=torch.cuda.get_device_name(device),
+                world_size=dist.get_world_size(),
+            ))
+
+        def print0(s, console=False, log=True):
+            if dist.get_rank() == 0:
+                if console:
+                    print(s)
+                if log:
+                    with open(logfile, "a") as f:
+                        print(s, file=f)
+
+        # we begin by logging this file itself
+        print0(code)
+        print0("="*100)
+        print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+               + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
+        print0(json.dumps(dict(hparams=hparams, config_diff=config_diff(hparams)), indent=2, sort_keys=True))
+        print0("="*100)
+
+        val_tokens = 20 * 524288
+        batch_size = 8 * 64 * 1024
+        mbs = 64
+        val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+
+        model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
+        model.compile(dynamic=False)
+
+        for _ in range(num_trials):
+
+
+            ########################################
+            #            Hyperparameters            #
+            ########################################
+
+            train_steps = hparams["train_steps"]
+
+            # initialize model parameters
+            for name, p in model.named_parameters():
+                w = p.data
+                if name.endswith("weight"):
+                    if "proj" in name:
+                        w.zero_()
+                    elif "embed" in name:
+                        w.normal_()  # default torch init
+                    else:
+                        w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+                elif name.endswith("bias"):
+                    w.zero_()
+                elif name.endswith("gains"):
+                    w.normal_(mean=1, std=0)
+                else:
+                    raise Exception(f"Uninitialized parameter: {name}")
+
+            # create the optimizer(s)
+            optimizer1 = AdamW([dict(params=[model.embed.weight], lr=hparams["embed_lr"]),
+                                dict(params=[model.proj.weight], lr=hparams["proj_lr"]),
+                                dict(params=[p for p in model.parameters() if p.ndim < 2], lr=hparams["scalar_lr"])],
+                               betas=hparams["adam_betas"], eps=hparams["adam_eps"],
+                               weight_decay=hparams["adam_wd"], fused=True)
+            optimizer2 = Leon([p for p in model.blocks.parameters() if p.ndim >= 2],
+                              lr=hparams["leon_lr"], weight_decay=hparams["leon_wd"],
+                              mu=hparams["leon_mu"], beta2=hparams["leon_beta2"],
+                              ns_iters=hparams["leon_ns_iters"], eps=hparams["leon_eps"])
+            optimizers = [optimizer1, optimizer2]
+            assert set(p for opt in optimizers for group in opt.param_groups
+                       for p in group["params"]) == set(model.parameters())
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["initial_lr"] = group["lr"]
+            for group in optimizer1.param_groups:
+                group["cooldown_frac"] = hparams["adam_cooldown_frac"]
+            for group in optimizer2.param_groups:
+                group["cooldown_frac"] = hparams["leon_cooldown_frac"]
+
+            # learning rate schedule: stable then decay
+            def set_hparams(step):
+                progress = step / train_steps
+                assert 0 <= progress < 1
+                for opt in optimizers:
+                    for group in opt.param_groups:
+                        cooldown_frac = group["cooldown_frac"]
+                        if progress < 1 - cooldown_frac:
+                            eta = 1.0
+                        else:
+                            eta = (1 - progress) / cooldown_frac
+                        group["lr"] = group["initial_lr"] * eta
+
+
+            ########################################
+            #        Training and Validation       #
+            ########################################
+
+            train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+            for p in model.parameters():
+                dist.broadcast(p.detach(), 0)
+            # start the clock
+            training_time = 0
+            last_val_step = 0
             dist.barrier()
             t0 = time.perf_counter()
+            for step in range(train_steps + 1):
 
-        if step == train_steps:
-            break
+                # --------------- VALIDATION SECTION -----------------
+                if step == train_steps or step % 125 == 0:
+                    # stop the clock
+                    dist.barrier()
+                    time_since_last_val = time.perf_counter() - t0
+                    step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
+                    last_val_step = step
+                    training_time += time_since_last_val
+                    model.eval()
+                    val_loss = 0
+                    with torch.no_grad():
+                        assert len(val_inputs) % mbs == 0
+                        for i in range(len(val_inputs) // mbs):
+                            val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+                    dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+                    val_loss /= val_tokens
+                    print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+                           + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+                    model.train()
+                    # start the clock again
+                    dist.barrier()
+                    t0 = time.perf_counter()
 
-        # --------------- TRAINING SECTION -----------------
-        inputs, targets = next(train_loader)
-        # accumulate across microbatches in case we are running with fewer than 8 gpus
-        assert len(inputs) % mbs == 0
-        for i in range(len(inputs) // mbs):
-            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
-        for name, p in model.named_parameters():
-            assert p.grad is not None, name
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-        # set optimization hyperparameters and take a step
-        set_hparams(step)
-        for opt in optimizers:
-            opt.step()
-        model.zero_grad(set_to_none=True)
-        approx_training_time = training_time + (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-               + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+                if step == train_steps:
+                    break
 
-dist.destroy_process_group()
+                # --------------- TRAINING SECTION -----------------
+                inputs, targets = next(train_loader)
+                # accumulate across microbatches in case we are running with fewer than 8 gpus
+                assert len(inputs) % mbs == 0
+                for i in range(len(inputs) // mbs):
+                    model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+                for name, p in model.named_parameters():
+                    assert p.grad is not None, name
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                # set optimization hyperparameters and take a step
+                set_hparams(step)
+                for opt in optimizers:
+                    opt.step()
+                model.zero_grad(set_to_none=True)
+                approx_training_time = training_time + (time.perf_counter() - t0)
+                print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+                       + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+    finally:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

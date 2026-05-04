@@ -63,35 +63,49 @@ Allowed only with explicit user instruction:
 
 The main experiment target is `train_gpt_simple_leon.py`.
 
-It is currently self-contained and has no argparse-based config system. The `hparams` dict controls training steps, cooldown fraction, AdamW auxiliary hyperparameters, and Leon hyperparameters.
+It is self-contained. The base `hparams` dict in `train_gpt_simple_leon.py` controls training steps, AdamW auxiliary hyperparameters, AdamW cooldown, Leon hyperparameters, Leon cooldown, Leon Newton-Schulz iteration count, and Leon diagonal stability epsilon.
 
 Important constraints:
 - The script expects `torchrun`/distributed CUDA environment variables.
-- Do not run it directly with plain `python` as a smoke test.
+- Plain `python3 records/track_3_optimization/train_gpt_simple_leon.py --dry-run ...` is safe and does not initialize CUDA/NCCL.
+- Do not run it directly with plain `python` for training.
 - Do not change Leon optimizer math unless explicitly requested.
 - Preserve the existing validation log format.
 
-## Running and Smoke Tests
+## Running and Dry-Run
 
-- No `launch.sh`, `run_experiment.sh`, dry-run mode, or repo-supported smoke-test command was found for `track_3_optimization`.
-- Do not run `python records/track_3_optimization/train_gpt_simple_leon.py` as a smoke test; the script initializes distributed CUDA at top level and expects `torchrun`.
-- The README documents this baseline launch pattern:
-  `torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_optimization/train_gpt_simple.py`
-- For Leon, the script appears designed for the same `torchrun` style, but no documented Leon-specific launch command exists. Ask before running it.
+- Safe dry-run, no GPU training:
+  `python3 records/track_3_optimization/train_gpt_simple_leon.py --dry-run`
+- Equivalent dry-run through the launcher:
+  `records/track_3_optimization/launch_leon.sh --dry-run`
+- Real Leon training uses the launcher, which prints and then executes a `torchrun` command:
+  `records/track_3_optimization/launch_leon.sh --trials 1`
+- The launcher sources `.venv/bin/activate` from the repo root when present before resolving `python` or `torchrun`.
+- Override hparams with repeatable `--set key=value`, for example:
+  `records/track_3_optimization/launch_leon.sh --dry-run --set leon_lr=0.02 --set leon_wd=0.03`
+- Unknown `--set` keys are recorded but may have no effect unless the script uses them.
+- There is no smoke-test mode at this time.
 
-TODO:
-- Add a thin `launch.sh` or `run_experiment.sh` that wraps the supported `torchrun` invocation, records script path, trial count, GPU count, commit, and log location.
-- Add a dry-run mode that validates imports/config/data discovery without initializing NCCL, compiling the model, or launching GPU training.
+Each run writes a unique output directory by default under:
+
+- `records/track_3_optimization/runs/leon/<timestamp>-<uuid>/`
+
+Expected files:
+
+- `train.log` for real training runs;
+- `config.json` for resolved hparams;
+- `config_diff.json` for exact differences from the base hparams;
+- `metadata.json` for argv, cwd, script path, dry-run flag, trial count, git commit, PyTorch/CUDA version, and data shard counts.
 
 ## Hyperparameter Sweep Rules
 
 - Preserve the base `hparams` dict. Use per-run overrides or copied configs rather than destructively rewriting the baseline values.
 - Keep architecture, dataset, batch size, validation protocol, and benchmark rules unchanged unless explicitly requested.
 - Do not change Leon optimizer math, Newton-Schulz coefficients, state buffers, distributed sync, or update scaling unless the task explicitly asks for optimizer algorithm changes.
-- Prefer conservative sweeps: change one or a small number of related hyperparameters at a time, especially `leon_wd`, `leon_lr`, then secondary values such as `cooldown_frac`, `leon_mu`, and `leon_beta2`.
+- Prefer conservative sweeps: change one or a small number of related hyperparameters at a time, especially `leon_wd`, `leon_lr`, then secondary values such as `adam_cooldown_frac`, `leon_cooldown_frac`, `leon_mu`, `leon_beta2`, `leon_ns_iters`, and `leon_eps`.
 - Predeclare the sweep grid before running jobs. Do not cherry-pick successful runs or omit failed runs from summaries.
 - Early stopping is allowed only for exploratory screening or time-to-threshold measurement. Final benchmark claims should use clearly reported fixed-budget or threshold-based protocols and must not omit failed or non-threshold-crossing runs.
-- For promising settings, run enough independent trials to summarize mean and variance; use the README significance rule when claiming benchmark validity.å
+- For promising settings, run enough independent trials to summarize mean and variance; use the README significance rule when claiming benchmark validity.
 
 ## Early-Stopping and Budget Rules
 
@@ -115,7 +129,8 @@ For final benchmark claims:
 
 ## Logging Expectations
 
-- The current script writes `logs/<uuid>.txt` relative to the working directory and includes the full source code at the top of the log.
+- The current Leon script writes `train.log`, `config.json`, `config_diff.json`, and `metadata.json` in a unique run directory.
+- `train.log` includes the full source code at the top for reproducibility.
 - Preserve the existing validation log format:
   `step:<step>/<train_steps> val_loss:<loss> train_time:<seconds>s step_avg:<ms>ms`
 - Sweep records should include script name, exact config diff from base, number of trials, GPU count/model, PyTorch/CUDA version from logs, log paths, final loss per run, mean/std final loss, and total training time.
@@ -153,7 +168,7 @@ Always report all attempted runs in the sweep, not just the best result.
 
 ## Done Criteria
 
-- If training or GPU jobs were launched, the user explicitly requested execution, the exact commands were shown, dry-run/smoke-test behavior was used when available, and all log paths were reported.
+- If training or GPU jobs were launched, the user explicitly requested execution, the exact commands were shown, dry-run behavior was used when available, and all log paths were reported.
 - Base config values and optimizer math are preserved unless the user requested changes.
 - Any edits are scoped to the requested experiment workflow.
 - Unsupported commands are marked `TODO` rather than invented.
