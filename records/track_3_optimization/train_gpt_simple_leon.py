@@ -41,7 +41,7 @@ BASE_HPARAMS = dict(
     leon_beta2          = 0.7,
     leon_cooldown_frac  = 0.7,
     leon_ns_iters       = 6,
-    leon_eps            = 1e-7,
+    leon_eps            = 1e-9,
 )
 
 
