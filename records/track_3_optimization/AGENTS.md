@@ -41,7 +41,8 @@ Before launching any training job, Codex must:
 2. run or provide a dry-run command first, if available;
 3. state the expected number of runs, GPUs used, and output/log directory;
 4. avoid overwriting existing logs or results;
-5. use the smallest reasonable test first unless the user explicitly asks for a full sweep.
+5. read `records/track_3_optimization/tuning_log.csv` when it exists, so the new run is informed by prior trials and does not duplicate completed work unintentionally;
+6. use the smallest reasonable test first unless the user explicitly asks for a full sweep.
 
 Allowed without extra confirmation:
 - reading code;
@@ -97,11 +98,24 @@ Expected files:
 - `config_diff.json` for exact differences from the base hparams;
 - `metadata.json` for argv, cwd, script path, dry-run flag, trial count, git commit, PyTorch/CUDA version, and data shard counts.
 
+## Experiment Tracking Log
+
+The cumulative local experiment ledger is:
+
+- `records/track_3_optimization/tuning_log.csv`
+
+Before choosing or launching new training runs, read this CSV when it exists and use it as the prior-trials record.
+
+After every training run finishes, append one new row to `tuning_log.csv` before launching the next run or giving a final summary. This includes completed runs, NaN/diverged runs, crashes, and manually stopped runs. Record enough information to reconstruct and compare the run, including at least run id/path, date, git commit, exact command, optimizer, key hyperparameters, max steps, best/final validation loss when available, `step_to_3_28` when reached, divergence/crash status, wall/train time, hardware, and notes.
+
+If a run fails before producing a validation result, still append a row with `diverged` or failure notes set appropriately and leave unavailable numeric fields blank.
+
 ## Hyperparameter Sweep Rules
 
 - Preserve the base `hparams` dict. Use per-run overrides or copied configs rather than destructively rewriting the baseline values.
 - Keep architecture, dataset, batch size, validation protocol, and benchmark rules unchanged unless explicitly requested.
 - Do not change Leon optimizer math, Newton-Schulz coefficients, state buffers, distributed sync, or update scaling unless the task explicitly asks for optimizer algorithm changes.
+- Consult `records/track_3_optimization/tuning_log.csv` before selecting sweep points, and avoid rerunning identical completed configurations unless intentionally estimating variance with additional trials.
 - Prefer conservative sweeps: change one or a small number of related hyperparameters at a time, especially `leon_wd`, `leon_lr`, then secondary values such as `adam_cooldown_frac`, `leon_cooldown_frac`, `leon_mu`, `leon_beta2`, `leon_ns_iters`, and `leon_eps`.
 - Predeclare the sweep grid before running jobs. Do not cherry-pick successful runs or omit failed runs from summaries.
 - Early stopping is allowed only for exploratory screening or time-to-threshold measurement. Final benchmark claims should use clearly reported fixed-budget or threshold-based protocols and must not omit failed or non-threshold-crossing runs.
@@ -133,6 +147,7 @@ For final benchmark claims:
 - `train.log` includes the full source code at the top for reproducibility.
 - Preserve the existing validation log format:
   `step:<step>/<train_steps> val_loss:<loss> train_time:<seconds>s step_avg:<ms>ms`
+- After each real training run, update `records/track_3_optimization/tuning_log.csv` with one row for that run before launching another run.
 - Sweep records should include script name, exact config diff from base, number of trials, GPU count/model, PyTorch/CUDA version from logs, log paths, final loss per run, mean/std final loss, and total training time.
 - Archive important completed logs under `records/track_3_optimization/results/` only when explicitly asked.
 
@@ -159,6 +174,7 @@ Always report all attempted runs in the sweep, not just the best result.
 - `records/track_3_optimization/README.md` - benchmark rules, quickstart for the baseline script, notable results, tuning guidance.
 - `records/track_3_optimization/train_gpt_simple.py` - Muon baseline training script.
 - `records/track_3_optimization/train_gpt_simple_leon.py` - current Leon optimizer experiment target.
+- `records/track_3_optimization/tuning_log.csv` - cumulative local tuning ledger; read before new runs and append after each run finishes.
 - `records/track_3_optimization/training_summary.md` - local run summaries.
 - `records/track_3_optimization/optimization_summary.md` - architecture/optimizer/tuning summary.
 - `records/track_3_optimization/make_figure.py` and `figure.png` - plots selected result logs.
@@ -169,6 +185,7 @@ Always report all attempted runs in the sweep, not just the best result.
 ## Done Criteria
 
 - If training or GPU jobs were launched, the user explicitly requested execution, the exact commands were shown, dry-run behavior was used when available, and all log paths were reported.
+- If any training run finished, crashed, diverged, or was stopped, `records/track_3_optimization/tuning_log.csv` was updated with a new row before final response.
 - Base config values and optimizer math are preserved unless the user requested changes.
 - Any edits are scoped to the requested experiment workflow.
 - Unsupported commands are marked `TODO` rather than invented.
