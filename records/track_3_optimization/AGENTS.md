@@ -60,6 +60,11 @@ Allowed only with explicit user instruction:
 - downloading datasets;
 - archiving or deleting results.
 
+Process safety:
+
+- Never kill, signal, reprioritize, or otherwise manage GPU or training processes unless the operating-system username is exactly `rj23424`.
+- When GPUs are occupied by processes owned by another username, treat the resources as unavailable and wait, choose a different allowed GPU allocation, or ask the user how to proceed.
+
 ## Main Script
 
 The main experiment target is `train_gpt_simple_leon.py`.
