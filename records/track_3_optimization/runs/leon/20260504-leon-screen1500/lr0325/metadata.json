@@ -1,0 +1,32 @@
+{
+  "argv": [
+    "records/track_3_optimization/train_gpt_simple_leon.py",
+    "--trials",
+    "1",
+    "--out-dir",
+    "records/track_3_optimization/runs/leon/20260504-leon-screen1500/lr0325",
+    "--set",
+    "train_steps=1500",
+    "--set",
+    "leon_lr=0.0325",
+    "--set",
+    "leon_wd=0.025",
+    "--set",
+    "leon_cooldown_frac=0.7"
+  ],
+  "cuda_version": "12.6",
+  "cwd": "/mnt/nas/rj23424/modded-nanogpt",
+  "device_name": "NVIDIA H100 NVL",
+  "dry_run": false,
+  "git_commit": "c89e2b8041680c72c91963246f35d98a723301d5",
+  "mode": "train",
+  "out_dir": "records/track_3_optimization/runs/leon/20260504-leon-screen1500/lr0325",
+  "script": "records/track_3_optimization/train_gpt_simple_leon.py",
+  "shard_counts": {
+    "train_shards": 40,
+    "val_shards": 1
+  },
+  "torch_version": "2.11.0+cu126",
+  "trials": 1,
+  "world_size": 4
+}
