@@ -115,6 +115,14 @@ After every training run finishes, append one new row to `tuning_log.csv` before
 
 If a run fails before producing a validation result, still append a row with `diverged` or failure notes set appropriately and leave unavailable numeric fields blank.
 
+## Version Control Hygiene
+
+- Periodically inspect `git status --short` during tuning work, especially after each completed, failed, or dry-run experiment.
+- Keep the repo tidy by staging and committing relevant experiment records in small, coherent commits before launching additional expensive GPU runs when practical.
+- Relevant experiment records include `tuning_log.csv`, run metadata/config files, and important training logs needed to reconstruct completed or failed runs.
+- Do not stage or commit unrelated user changes. If unrelated dirty files are present, leave them untouched and report them.
+- Prefer ordinary non-interactive commits; do not amend existing commits unless the user explicitly asks.
+
 ## Hyperparameter Sweep Rules
 
 - Preserve the base `hparams` dict. Use per-run overrides or copied configs rather than destructively rewriting the baseline values.
