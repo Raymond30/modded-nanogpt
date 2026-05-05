@@ -1,0 +1,5 @@
+{
+  "leon_lr": 0.0525,
+  "leon_wd": 0.035,
+  "train_steps": 1500
+}
