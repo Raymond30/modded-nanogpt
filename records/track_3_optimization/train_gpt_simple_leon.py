@@ -42,6 +42,14 @@ BASE_HPARAMS = dict(
     leon_cooldown_frac  = 0.7,
     leon_ns_iters       = 6,
     leon_eps            = 1e-9,
+    leon_l_scale        = 1.0,
+    leon_log_diagnostics = False,
+    leon_diag_interval  = 125,
+    leon_diag_patterns  = (
+        "blocks.0.attn.q.weight",
+        "blocks.6.mlp.proj.weight",
+        "blocks.11.attn.proj.weight",
+    ),
 )
 
 
@@ -299,12 +307,12 @@ class GPT(nn.Module):
 def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_buffer: Tensor,
                        momentum: float = 0.95, beta2: float = 0.7,
                        ns_iters: int = 6, ns_coeffs: tuple = (2, -1.5, 0.5),
-                       eps: float = 1e-7) -> Tensor:
+                       eps: float = 1e-7, l_scale: float = 1.0) -> Tensor:
     """
     Leon update: Nesterov momentum + Newton-Schulz orthogonalization with
     augmented Gram matrix (second momentum buffer).
 
-    Computes (GG^T + L)^{-0.5} G where L is an EMA of the gradient Gram matrix,
+    Computes (GG^T + L)^{-0.5} G where L is an EMA-like gradient Gram statistic,
     using Newton-Schulz iterations to approximate the matrix inverse square root.
 
     Args:
@@ -316,6 +324,7 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
         ns_iters: Number of Newton-Schulz iterations
         ns_coeffs: (a, b, c) coefficients for the NS iteration
         eps: Diagonal stability epsilon added to the augmented Gram matrix
+        l_scale: Multiplier for the second-momentum Gram contribution
     """
     is_tall = grad.size(-2) >= grad.size(-1)
 
@@ -328,12 +337,14 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
     # 1. Update first momentum (Nesterov)
     momentum_buffer.lerp_(grad, 1 - momentum)
     g = grad.lerp_(momentum_buffer, momentum)  # in-place
+    g.div_(1 - momentum)
 
     # 2. Update second momentum (Gram EMA)
     second_momentum_buffer.lerp_(gram_tmp, 1 - beta2)
 
     X = g.bfloat16()
-    L = second_momentum_buffer.float()
+    second_momentum_for_update = second_momentum_buffer.float() / (1 - beta2)
+    L = second_momentum_for_update * l_scale
     A = 0.5 * (L + L.transpose(-2, -1))  # ensure symmetry
 
     # 3. Scale so that tr(GG^T + L) ≈ 1
@@ -382,16 +393,126 @@ class Leon(torch.optim.Optimizer):
     an augmented Gram matrix (second momentum buffer).
 
     Unlike Muon which recomputes A = X@X^T each NS iteration, Leon maintains
-    a second momentum buffer L (EMA of gradient Gram matrices) and augments
+    a second momentum buffer L (scaled from an EMA of gradient Gram matrices) and augments
     the iteration matrix: A = X@X^T + L. A is also iterated alongside X.
     """
     def __init__(self, params, lr=0.025, weight_decay=0.025, mu=0.95, beta2=0.7,
-                 ns_iters=6, eps=1e-7):
+                 ns_iters=6, eps=1e-7, l_scale=1.0):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, beta2=beta2,
-                        ns_iters=ns_iters, eps=eps)
+                        ns_iters=ns_iters, eps=eps, l_scale=l_scale)
         super().__init__(params, defaults)
+        self.param_names = {}
+
+    def diagnostic_stats(self, selected_patterns):
+        if isinstance(selected_patterns, str):
+            selected_patterns = (selected_patterns,)
+        selected_patterns = tuple(selected_patterns)
+
+        rows = []
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        with torch.no_grad():
+            for group in self.param_groups:
+                params = group["params"]
+                for base_i in range(0, len(params), world_size):
+                    if base_i + rank >= len(params):
+                        continue
+                    p = params[base_i + rank]
+                    name = self.param_names.get(p, f"param_{base_i + rank}")
+                    if selected_patterns and not any(pattern in name for pattern in selected_patterns):
+                        continue
+                    if p.grad is None:
+                        continue
+
+                    state = self.state[p]
+                    if len(state) == 0:
+                        momentum_buffer = torch.zeros_like(p, dtype=torch.float32)
+                        min_D = min(p.shape[-2], p.shape[-1])
+                        second_momentum_buffer = torch.zeros(
+                            min_D, min_D, dtype=torch.float32, device=p.device
+                        )
+                    else:
+                        momentum_buffer = state["momentum_buffer"]
+                        second_momentum_buffer = state["second_momentum_buffer"]
+
+                    grad = p.grad.float()
+                    momentum_clone = momentum_buffer.clone()
+                    l_clone = second_momentum_buffer.clone()
+                    grad_for_update = grad.clone()
+                    update = leon_orthogonalize(
+                        grad_for_update, momentum_clone, l_clone,
+                        momentum=group["mu"], beta2=group["beta2"],
+                        ns_iters=group["ns_iters"], eps=group["eps"],
+                        l_scale=group["l_scale"],
+                    )
+                    update *= max(1, p.size(-2) / p.size(-1))**0.5
+
+                    momentum_l0 = momentum_buffer.clone()
+                    l_l0 = second_momentum_buffer.clone()
+                    update_l0 = leon_orthogonalize(
+                        grad.clone(), momentum_l0, l_l0,
+                        momentum=group["mu"], beta2=group["beta2"],
+                        ns_iters=group["ns_iters"], eps=group["eps"],
+                        l_scale=0.0,
+                    )
+                    update_l0 *= max(1, p.size(-2) / p.size(-1))**0.5
+
+                    update_float = update.float()
+                    update_l0_float = update_l0.float()
+                    update_norm = update_float.norm()
+                    update_l0_norm = update_l0_float.norm()
+                    cosine_denom = (update_norm * update_l0_norm).clamp_min(1e-12)
+                    update_l0_cos = (update_float.flatten() @ update_l0_float.flatten()) / cosine_denom
+                    grad_norm = grad.norm()
+                    momentum_for_stats = momentum_clone / (1 - group["mu"])
+                    l_for_stats = l_clone / (1 - group["beta2"])
+                    momentum_norm = momentum_for_stats.norm()
+                    update_grad_cos = (update_float.flatten() @ grad.flatten()) / (
+                        update_norm * grad_norm
+                    ).clamp_min(1e-12)
+                    update_momentum_cos = (update_float.flatten() @ momentum_for_stats.flatten()) / (
+                        update_norm * momentum_norm
+                    ).clamp_min(1e-12)
+
+                    l_sym = 0.5 * (l_for_stats + l_for_stats.transpose(-2, -1))
+                    l_trace = l_sym.diagonal(dim1=-2, dim2=-1).sum().clamp_min(0)
+                    l_fro = l_sym.norm()
+                    g_sq = grad_for_update.bfloat16().float().pow(2).sum()
+                    scaled_l_trace = group["l_scale"] * l_trace
+                    l_trace_fraction = scaled_l_trace / (g_sq + scaled_l_trace).clamp_min(1e-12)
+                    if l_trace > 0:
+                        l_top_eval = torch.linalg.eigvalsh(l_sym).amax().clamp_min(0)
+                        l_top_eval_fraction = l_top_eval / l_trace.clamp_min(1e-12)
+                    else:
+                        l_top_eval = l_trace
+                        l_top_eval_fraction = l_trace
+
+                    weight_norm = p.float().norm()
+                    relative_update = group["lr"] * update_norm / weight_norm.clamp_min(1e-12)
+                    relative_update_l0 = group["lr"] * update_l0_norm / weight_norm.clamp_min(1e-12)
+
+                    rows.append(dict(
+                        name=name,
+                        lr=float(group["lr"]),
+                        weight_norm=float(weight_norm.item()),
+                        grad_norm=float(grad_norm.item()),
+                        momentum_norm=float(momentum_norm.item()),
+                        update_norm=float(update_norm.item()),
+                        update_l0_norm=float(update_l0_norm.item()),
+                        relative_update=float(relative_update.item()),
+                        relative_update_l0=float(relative_update_l0.item()),
+                        update_l0_cos=float(update_l0_cos.item()),
+                        update_grad_cos=float(update_grad_cos.item()),
+                        update_momentum_cos=float(update_momentum_cos.item()),
+                        l_trace=float(l_trace.item()),
+                        l_fro=float(l_fro.item()),
+                        l_trace_fraction=float(l_trace_fraction.item()),
+                        l_top_eval=float(l_top_eval.item()),
+                        l_top_eval_fraction=float(l_top_eval_fraction.item()),
+                    ))
+        return rows
 
     @torch.no_grad()
     def step(self):
@@ -416,6 +537,7 @@ class Leon(torch.optim.Optimizer):
                         grad, state["momentum_buffer"], state["second_momentum_buffer"],
                         momentum=group["mu"], beta2=group["beta2"],
                         ns_iters=group["ns_iters"], eps=group["eps"],
+                        l_scale=group["l_scale"],
                     )
                     update *= max(1, p.size(-2) / p.size(-1))**0.5
                     p.mul_(1 - group["lr"] * group["weight_decay"])
@@ -525,7 +647,9 @@ def main():
             optimizer2 = Leon([p for p in model.blocks.parameters() if p.ndim >= 2],
                               lr=hparams["leon_lr"], weight_decay=hparams["leon_wd"],
                               mu=hparams["leon_mu"], beta2=hparams["leon_beta2"],
-                              ns_iters=hparams["leon_ns_iters"], eps=hparams["leon_eps"])
+                              ns_iters=hparams["leon_ns_iters"], eps=hparams["leon_eps"],
+                              l_scale=hparams["leon_l_scale"])
+            optimizer2.param_names = {p: name for name, p in model.named_parameters()}
             optimizers = [optimizer1, optimizer2]
             assert set(p for opt in optimizers for group in opt.param_groups
                        for p in group["params"]) == set(model.parameters())
@@ -549,6 +673,43 @@ def main():
                         else:
                             eta = (1 - progress) / cooldown_frac
                         group["lr"] = group["initial_lr"] * eta
+
+            def log_leon_diagnostics(step):
+                if not hparams["leon_log_diagnostics"]:
+                    return
+                interval = hparams["leon_diag_interval"]
+                if interval <= 0 or step % interval != 0:
+                    return
+                local_rows = optimizer2.diagnostic_stats(hparams["leon_diag_patterns"])
+                gathered_rows = [None] * dist.get_world_size()
+                dist.all_gather_object(gathered_rows, local_rows)
+                if dist.get_rank() != 0:
+                    return
+                rows = [row for rank_rows in gathered_rows for row in rank_rows]
+                rows.sort(key=lambda row: row["name"])
+                for row in rows:
+                    print0(
+                        "diag"
+                        + f" step:{step}"
+                        + f" name:{row['name']}"
+                        + f" lr:{row['lr']:.8g}"
+                        + f" weight_norm:{row['weight_norm']:.6g}"
+                        + f" grad_norm:{row['grad_norm']:.6g}"
+                        + f" momentum_norm:{row['momentum_norm']:.6g}"
+                        + f" update_norm:{row['update_norm']:.6g}"
+                        + f" update_l0_norm:{row['update_l0_norm']:.6g}"
+                        + f" relative_update:{row['relative_update']:.6g}"
+                        + f" relative_update_l0:{row['relative_update_l0']:.6g}"
+                        + f" update_l0_cos:{row['update_l0_cos']:.6g}"
+                        + f" update_grad_cos:{row['update_grad_cos']:.6g}"
+                        + f" update_momentum_cos:{row['update_momentum_cos']:.6g}"
+                        + f" l_trace:{row['l_trace']:.6g}"
+                        + f" l_fro:{row['l_fro']:.6g}"
+                        + f" l_trace_fraction:{row['l_trace_fraction']:.6g}"
+                        + f" l_top_eval:{row['l_top_eval']:.6g}"
+                        + f" l_top_eval_fraction:{row['l_top_eval_fraction']:.6g}",
+                        console=False,
+                    )
 
 
             ########################################
@@ -602,6 +763,7 @@ def main():
                     dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
                 # set optimization hyperparameters and take a step
                 set_hparams(step)
+                log_leon_diagnostics(step + 1)
                 for opt in optimizers:
                     opt.step()
                 model.zero_grad(set_to_none=True)

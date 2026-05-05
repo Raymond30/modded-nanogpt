@@ -63,7 +63,7 @@ Allowed only with explicit user instruction:
 
 Process safety:
 
-- Never kill, signal, reprioritize, or otherwise manage GPU or training processes unless the operating-system username is exactly `rj23424`.
+- Never kill, signal, reprioritize, or otherwise manage GPU or training processes unless the operating-system username is exactly `rj23424` or `rj23424@austin.utexas.edu`.
 - When GPUs are occupied by processes owned by another username, treat the resources as unavailable and wait, choose a different allowed GPU allocation, or ask the user how to proceed.
 
 ## Main Script
