@@ -88,6 +88,7 @@ Important constraints:
 - Real Leon training uses the launcher, which prints and then executes a `torchrun` command:
   `records/track_3_optimization/launch_leon.sh --trials 1`
 - The launcher sources `.venv/bin/activate` from the repo root when present before resolving `python` or `torchrun`.
+- Do not reuse the same `--out-dir` for a dry-run and the subsequent real training run. `train_gpt_simple_leon.py` creates the run directory in both modes with `exist_ok=False`, so a dry-run can leave a stale directory that causes the real `torchrun` launch to fail after distributed init without ever creating `train.log`. Use a disposable dry-run path, such as under `/tmp`, and a fresh real run directory for the actual launch.
 - Override hparams with repeatable `--set key=value`, for example:
   `records/track_3_optimization/launch_leon.sh --dry-run --set leon_lr=0.02 --set leon_wd=0.03`
 - Unknown `--set` keys are recorded but may have no effect unless the script uses them.

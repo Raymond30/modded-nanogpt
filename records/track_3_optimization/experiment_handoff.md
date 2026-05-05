@@ -1,6 +1,6 @@
 # Track 3 Optimization Experiment Handoff
 
-Last updated: 2026-05-05 14:20 America/Chicago
+Last updated: 2026-05-05 17:59 America/Chicago
 
 This stable handoff file summarizes the experiments from the recent Codex tuning conversation. The authoritative run ledger remains `records/track_3_optimization/tuning_log.csv`; use this file as a fast orientation layer before selecting the next run, and update it in place after meaningful new results.
 
@@ -9,6 +9,7 @@ This stable handoff file summarizes the experiments from the recent Codex tuning
 - Read `records/track_3_optimization/AGENTS.md`, `records/track_3_optimization/tuning_log.csv`, and this handoff before launching new runs.
 - Append one row to `tuning_log.csv` immediately after each completed, failed, or crashed run.
 - Keep experiment artifacts committed periodically. Relevant artifacts include `tuning_log.csv`, run directories, metadata/configs, and logs needed for reproducibility.
+- Do not reuse the same `--out-dir` for a dry-run and the real launch. `train_gpt_simple_leon.py` creates the run directory with `exist_ok=False` in both modes, so a dry-run can leave a stale directory that causes the subsequent real `torchrun` launch to hang after distributed init without ever creating `train.log`.
 - User granted permission for 30 GPU launches without further confirmation so long as GPUs are available. The latest completed diagnostic sweep consumed runs 14-18 of that allowance in this conversation context. One additional sandbox retry failed before using GPUs.
 - Main screening runs used `train_steps=1500`; the L-scale diagnostic sweep used `train_steps=500`. No logged run reached `val_loss < 3.28`.
 - Many later 1500-step screens used 2 GPUs because only GPUs 1 and 2 were available, while the latest diagnostics used 4 GPUs. Do not compare wall time directly between 4-GPU and 2-GPU runs.
@@ -18,7 +19,7 @@ This stable handoff file summarizes the experiments from the recent Codex tuning
 
 | Category | Run | Key hparams | Final val loss | Run path |
 | --- | --- | --- | ---: | --- |
-| Best Leon screen | `lr0525_wd030_cd060_2gpu` | `leon_lr=0.0525`, `leon_wd=0.03`, `leon_cooldown_frac=0.6` | 3.50950 | `records/track_3_optimization/runs/leon/20260504-leon-screen1500/lr0525_wd030_cd060_2gpu` |
+| Best Leon screen | `retune1500_lr035_wd0275_b260_4gpu` | `leon_lr=0.035`, `leon_wd=0.0275`, `leon_cooldown_frac=0.6`, `leon_beta2=0.6`, current codepath | 3.44937 | `records/track_3_optimization/runs/leon/20260505-leon-retune1500-cda40ac/lr035_wd0275_b260_4gpu` |
 | Best original Muon baseline | `muon1500_2gpu` | `lr=0.025`, `wd=0.025`, `momentum=0.95`, `ns_steps=12` | 3.43079 | `records/track_3_optimization/runs/muon/20260504-muon-screen1500` |
 | Muon with Leon-like NS | `muon1500_leonns_2gpu` | `lr=0.025`, `wd=0.025`, `momentum=0.95`, `ns_steps=6`, `eps=1e-9` | 3.44804 | `records/track_3_optimization/runs/muon/20260505-muon-leonns-screen1500` |
 | Leon L=0 with Muon hparams | `leon_l0_muon_hparams_4gpu` | `leon_lr=0.025`, `leon_wd=0.025`, `leon_cooldown_frac=0.7`, `L=0` | 3.44907 | `records/track_3_optimization/runs/leon/20260505-leon-l0-screen1500/muon_hparams_4gpu` |
@@ -28,8 +29,17 @@ This stable handoff file summarizes the experiments from the recent Codex tuning
 
 Interpretation:
 
-- Leon tuning improved from `3.57447` at the starting config to `3.50950` at the current best.
-- The original Muon baseline remains stronger than the tuned Leon screens by `0.07871` final val loss.
+- On the current unnormalized-sum codepath, the first corrected 1500-step retune point `leon_lr=0.035`, `leon_wd=0.03`, `leon_cooldown_frac=0.6` reached `3.45093`, improving the prior best tuned Leon screen by `-0.05857`.
+- That new Leon best is now only `0.02014` behind the original 12-step Muon baseline, `0.00289` behind the Muon Leon-NS baseline, and `0.00186` behind the Leon `L=0` control.
+- The next LR point `leon_lr=0.045` finished at `3.45492`, so `0.035` remains ahead by `0.00399` while the `0.0525` and `0.06` runs are still pending.
+- The user-requested lower probe `leon_lr=0.025` finished at `3.45329`, which is `0.00236` behind `0.035` but `0.00163` better than `0.045`, so the current LR ordering is `0.035` best, then `0.025`, then `0.045`.
+- The first WD sweep point around the `lr=0.035` center, `leon_wd=0.0275`, finished at `3.45028`, improving `wd=0.03` by `0.00065` and becoming the current best tested Leon configuration while the rest of the WD bracket is still pending.
+- The next lower WD probe `leon_wd=0.025` finished at `3.45110`, which is `0.00082` behind `wd=0.0275` and `0.00017` behind `wd=0.03`, so `wd=0.0275` still leads and the downward side has not improved yet.
+- The escalated retry at `leon_wd=0.0225` finished at `3.45029` after an initial sandbox TCPStore failure. That result is only `0.00001` behind `wd=0.0275` and `0.00064` better than `wd=0.03`, so the lower side is now effectively tied with the current best on a single run.
+- The next lower probe `leon_wd=0.02` finished at `3.45078`. That is `0.00049` behind `wd=0.0225` and `0.00050` behind `wd=0.0275`, so the best lower-side point remains `wd=0.0225` and the practical near-tie is now between `0.0225` and `0.0275`.
+- The first `leon_beta2` sweep point from the nominal best WD center, `leon_beta2=0.6` at `lr=0.035`, `wd=0.0275`, `cd=0.6`, finished at `3.44937`. It beat the previous best Leon screen by `0.00091` and outperformed the old `beta2=0.7` center at every validation checkpoint from step `125` through `1500`.
+- The next lower beta2 probe, `leon_beta2=0.5` at the same center, finished at `3.44988`. That is `0.00051` worse than `beta2=0.6`, though still `0.00040` better than the old `beta2=0.7` center, so the beta2 bracket now points to a local optimum near `0.6`.
+- The first `leon_mu` probe from the current beta2 center, `leon_mu=0.925`, finished at `3.45394`. That is `0.00457` worse than the current best `mu=0.95` center, so the lower side is not promising and the sweep should move upward next.
 - The Muon Leon-NS rerun is better than tuned Leon by `0.06146`, but worse than original 12-step Muon by `0.01725`.
 - Leon with `L=0` and Muon hparams landed at `3.44907`, near-identical to Muon Leon-NS (`+0.00103` final val), indicating the earlier Leon gap was mainly from the nonzero second-momentum `L` contribution and tuned hparams rather than the optimizer wrapper.
 - The 500-step `leon_l_scale` diagnostic sweep was monotone: `0.0` final `3.79464`, `0.1` `3.87248`, `0.25` `3.93081`, `0.5` `3.99168`, `1.0` `4.04142`. Diagnostics show full `L` makes `tr(L)` about 98.8% of the normalization denominator at steps 125-375 and shrinks the update to about 16-17% of the hypothetical L=0 update.
@@ -52,6 +62,7 @@ Interpretation:
 | Leon L-scale diagnostics | `lscale{0,010,025,050,1}_500_4gpu_diag` | Added `leon_l_scale` and checkpoint diagnostics. Lower `L` scale was better at every checkpoint; full `L` mostly damped the update through trace domination rather than producing a wholly different direction. |
 | Historical bias-correction follow-up | `lscale1_biascorr_500_4gpu_diag` | Old experimental branch using `m/(1-mu^t)` and `L/(1-beta2^t)`. Full-L bias correction did not help, and that branch is no longer the active implementation. |
 | Unnormalized-sum full-L diagnostic | `lscale1_unnormsum_500_4gpu_diag` | Current code divides the Nesterov-updated `g` by `1-mu` and the second-momentum matrix by `1-beta2`. This largely removed the earlier scaling pathology for `l_scale=1.0`. |
+| Current-codepath 1500-step retune restart | `retune1500_lr035_retry_4gpu`, `retune1500_lr045_4gpu`, `retune1500_lr025_4gpu`, `retune1500_lr035_wd0275_4gpu`, `retune1500_lr035_wd025_4gpu`, `retune1500_lr035_wd0225_retry_4gpu`, `retune1500_lr035_wd020_4gpu`, `retune1500_lr035_wd0275_b260_4gpu`, `retune1500_lr035_wd0275_b250_4gpu`, `retune1500_lr035_wd0275_b260_mu0925_4gpu` | After avoiding dry-run `out-dir` reuse, the corrected screens established `lr=0.035` as the best LR center; `wd=0.0275` and `wd=0.0225` formed the effective WD tie, `beta2=0.6` produced a new best overall Leon run, `beta2=0.5` regressed slightly, and the first `mu` probe at `0.925` also regressed, suggesting `mu` should move upward from `0.95`. |
 
 ## Detailed Results
 
@@ -90,12 +101,22 @@ Interpretation:
 | `lscale050_500_4gpu_diag` | Leon | `leon_l_scale=0.5`, diagnostics every 125 steps | 3.99168 | no | Slower than `0.25`, faster than full L; update norm ratio about `0.22` at steps 125-375. |
 | `lscale1_unnormsum_500_4gpu_diag` | Leon | current `leon_l_scale=1.0` unnormalized-sum codepath, diagnostics every 125 steps | 3.80020 | no | Improved over the old full-L diagnostic by `-0.24122`; `tr(L)` fraction dropped to about `0.50 / 0.45 / 0.40` and update ratio rose to about `0.78 / 0.80 / 0.83` at steps `125 / 250 / 375`. |
 | `lscale1_biascorr_500_4gpu_diag` | Leon | historical `leon_l_scale=1.0`, `leon_bias_correction=True` branch | 4.05228 | no | Slightly worse than uncorrected full-L diagnostic by `+0.01086`; kept only as a historical comparison row. |
+| `retune1500_lr035_retry_4gpu` | Leon | current codepath, `lr=0.035`, `wd=0.03`, `cd=0.6` | 3.45093 | no | First corrected 1500-step retune run on the current codepath; better than the earlier tuned Leon best by `-0.05857` and nearly tied with the Leon `L=0` control. |
+| `retune1500_lr045_4gpu` | Leon | current codepath, `lr=0.045`, `wd=0.03`, `cd=0.6` | 3.45492 | no | Second corrected 1500-step retune run; worse than `lr=0.035` by `+0.00399` but still better than the older tuned Leon best by `-0.05458`. |
+| `retune1500_lr025_4gpu` | Leon | current codepath, `lr=0.025`, `wd=0.03`, `cd=0.6` | 3.45329 | no | User-requested lower-LR replacement run; worse than `lr=0.035` by `+0.00236` but better than `lr=0.045` by `-0.00163`. |
+| `retune1500_lr035_wd0275_4gpu` | Leon | current codepath, `lr=0.035`, `wd=0.0275`, `cd=0.6` | 3.45028 | no | First WD sweep point around the current LR center; final val was lower than the `wd=0.03` center by `0.00065` and currently leads the bracket. |
+| `retune1500_lr035_wd025_4gpu` | Leon | current codepath, `lr=0.035`, `wd=0.025`, `cd=0.6` | 3.45110 | no | Second lower-WD probe around the current LR center; final val was higher than `wd=0.0275` by `0.00082` and higher than `wd=0.03` by `0.00017`. |
+| `retune1500_lr035_wd0225_retry_4gpu` | Leon | current codepath, `lr=0.035`, `wd=0.0225`, `cd=0.6` | 3.45029 | no | Escalated rerun after sandbox TCPStore failure; effectively tied with `wd=0.0275` at `+0.00001` and better than `wd=0.03` by `-0.00064`. |
+| `retune1500_lr035_wd020_4gpu` | Leon | current codepath, `lr=0.035`, `wd=0.02`, `cd=0.6` | 3.45078 | no | Third lower-WD probe around the current LR center; worse than `wd=0.0225` by `+0.00049` and worse than `wd=0.0275` by `+0.00050`, so it did not improve the lower side. |
+| `retune1500_lr035_wd0275_b260_4gpu` | Leon | current codepath, `lr=0.035`, `wd=0.0275`, `cd=0.6`, `beta2=0.6` | 3.44937 | no | First beta2 sweep point; improved the old `beta2=0.7` center by `-0.00091` and beat it at every logged validation checkpoint. |
+| `retune1500_lr035_wd0275_b250_4gpu` | Leon | current codepath, `lr=0.035`, `wd=0.0275`, `cd=0.6`, `beta2=0.5` | 3.44988 | no | Second beta2 sweep point; regressed versus `beta2=0.6` by `+0.00051` but still improved the old `beta2=0.7` center by `-0.00040`. |
+| `retune1500_lr035_wd0275_b260_mu0925_4gpu` | Leon | current codepath, `lr=0.035`, `wd=0.0275`, `cd=0.6`, `beta2=0.6`, `mu=0.925` | 3.45394 | no | First mu sweep point; regressed versus the current `mu=0.95` center by `+0.00457`, so the lower side is not promising. |
 
 ## Next Recommended Steps
 
-1. Treat `leon_lr=0.0525`, `leon_wd=0.03`, `leon_cooldown_frac=0.6` as the current Leon center for 1500-step screens.
-2. If continuing pure hyperparameter tuning, consider small reruns around the current best to estimate noise before chasing tiny deltas, because recent cooldown differences are in the `0.0006` to `0.0026` range.
-3. Reasonable next Leon probes, if still using single-run 1500-step screens, are `leon_lr=0.0525, leon_wd=0.03, leon_cooldown_frac=0.6` with adjacent parameters such as `adam_cooldown_frac`, `leon_beta2`, `leon_mu`, `leon_eps`, or `leon_ns_iters`.
+1. Treat `leon_lr=0.035`, `leon_wd=0.0275`, `leon_cooldown_frac=0.6`, `leon_beta2=0.6` as the current best-tested Leon center on the active codepath.
+2. The tested current-codepath LR ordering is `0.035` best, `0.025` second, and `0.045` third at `wd=0.03`; the tested WD ordering around the `0.035` LR center is `0.0275` and `0.0225` essentially tied, then `0.02`, then `0.03`, then `0.025`.
+3. The most informative next mu experiment is now an upper-side follow-up at `leon_mu=0.975` with the new best center unchanged otherwise. Since `0.925` regressed relative to `0.95`, the current bracket points above the current center rather than below it.
 4. If comparing against Muon, keep both Muon baselines in view: original 12-step Muon is the stronger reference, while Muon Leon-NS isolates part of the orthogonalization change.
 5. For algorithm attribution, the Leon L=0 control plus the L-scale sweep are the strongest evidence so far: L=0 reproduces Muon Leon-NS nearly exactly, and increasing `L` scale monotonically slows the 500-step trajectory.
 6. If continuing algorithm work on nonzero `L`, do not use full `L` unchanged. Test mechanisms that keep `tr(L)` from dominating normalization, such as much smaller scale, lower `beta2`, delayed activation, clipping/normalizing `tr(L)`, or computing Gram statistics from the same Nesterov update being orthogonalized.
