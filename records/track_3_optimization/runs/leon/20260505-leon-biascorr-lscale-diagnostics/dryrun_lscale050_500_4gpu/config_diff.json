@@ -1,0 +1,6 @@
+{
+  "leon_bias_correction": true,
+  "leon_l_scale": 0.5,
+  "leon_log_diagnostics": true,
+  "train_steps": 500
+}
