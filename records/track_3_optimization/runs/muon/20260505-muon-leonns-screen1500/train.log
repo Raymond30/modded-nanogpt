@@ -392,3 +392,20 @@ for _ in range(num_trials):
                + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
 dist.destroy_process_group()
+
+====================================================================================================
+Running PyTorch 2.10.0+cu128 compiled for CUDA 12.8 on NVIDIA H100 NVL with world_size 2
+====================================================================================================
+step:0/1500 val_loss:10.82585 train_time:0.000s step_avg:nanms
+step:125/1500 val_loss:4.81629 train_time:109.494s step_avg:875.95ms
+step:250/1500 val_loss:4.19937 train_time:211.829s step_avg:818.68ms
+step:375/1500 val_loss:3.98373 train_time:314.169s step_avg:818.72ms
+step:500/1500 val_loss:3.85832 train_time:416.370s step_avg:817.60ms
+step:625/1500 val_loss:3.76373 train_time:518.580s step_avg:817.68ms
+step:750/1500 val_loss:3.69361 train_time:620.876s step_avg:818.37ms
+step:875/1500 val_loss:3.63512 train_time:723.120s step_avg:817.95ms
+step:1000/1500 val_loss:3.58310 train_time:825.324s step_avg:817.63ms
+step:1125/1500 val_loss:3.54055 train_time:927.568s step_avg:817.95ms
+step:1250/1500 val_loss:3.50055 train_time:1029.829s step_avg:818.09ms
+step:1375/1500 val_loss:3.46802 train_time:1132.079s step_avg:818.00ms
+step:1500/1500 val_loss:3.44804 train_time:1234.346s step_avg:818.14ms
