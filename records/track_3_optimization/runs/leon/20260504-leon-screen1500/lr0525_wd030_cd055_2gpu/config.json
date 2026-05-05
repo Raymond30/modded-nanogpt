@@ -1,0 +1,20 @@
+{
+  "adam_betas": [
+    0.8,
+    0.95
+  ],
+  "adam_cooldown_frac": 0.7,
+  "adam_eps": 1e-10,
+  "adam_wd": 0.0,
+  "embed_lr": 0.3,
+  "leon_beta2": 0.7,
+  "leon_cooldown_frac": 0.55,
+  "leon_eps": 1e-09,
+  "leon_lr": 0.0525,
+  "leon_mu": 0.95,
+  "leon_ns_iters": 6,
+  "leon_wd": 0.03,
+  "proj_lr": 0.003125,
+  "scalar_lr": 0.01,
+  "train_steps": 1500
+}
