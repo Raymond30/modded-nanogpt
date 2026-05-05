@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "records/track_3_optimization/runs/muon/20260504-muon-screen1500/train_gpt_simple_muon_screen1500.py",
+    "1"
+  ],
+  "command": "CUDA_VISIBLE_DEVICES=1,2 torchrun --standalone --nproc_per_node=2 records/track_3_optimization/runs/muon/20260504-muon-screen1500/train_gpt_simple_muon_screen1500.py 1",
+  "cuda_visible_devices": "1,2",
+  "cuda_version": "12.8",
+  "device_name": "NVIDIA H100 NVL",
+  "git_commit": "412e9fed1438396e383c501416bcb04e10ef77ed",
+  "logfile_original": "logs/631b8d51-194c-40fd-87c3-f713aba781b4.txt",
+  "mode": "train",
+  "notes": "Copy of records/track_3_optimization/train_gpt_simple.py with only train_steps changed from 3375 to 1500 for same-budget screening.",
+  "script": "records/track_3_optimization/runs/muon/20260504-muon-screen1500/train_gpt_simple_muon_screen1500.py",
+  "torch_version": "2.10.0+cu128",
+  "trials": 1,
+  "world_size": 2
+}
