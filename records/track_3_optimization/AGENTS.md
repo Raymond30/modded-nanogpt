@@ -42,7 +42,8 @@ Before launching any training job, Codex must:
 3. state the expected number of runs, GPUs used, and output/log directory;
 4. avoid overwriting existing logs or results;
 5. read `records/track_3_optimization/tuning_log.csv` when it exists, so the new run is informed by prior trials and does not duplicate completed work unintentionally;
-6. use the smallest reasonable test first unless the user explicitly asks for a full sweep.
+6. read `records/track_3_optimization/experiment_handoff.md` when it exists, so the new run continues from the latest summarized experiment context and decisions;
+7. use the smallest reasonable test first unless the user explicitly asks for a full sweep.
 
 Allowed without extra confirmation:
 - reading code;
@@ -109,9 +110,15 @@ The cumulative local experiment ledger is:
 
 - `records/track_3_optimization/tuning_log.csv`
 
-Before choosing or launching new training runs, read this CSV when it exists and use it as the prior-trials record.
+The human-readable experiment handoff is:
+
+- `records/track_3_optimization/experiment_handoff.md`
+
+Before choosing or launching new training runs, read both the CSV and the handoff when they exist. Use the CSV as the authoritative row-level prior-trials record, and use the handoff as the current summarized context for decisions, best-known settings, caveats, and next recommended probes.
 
 After every training run finishes, append one new row to `tuning_log.csv` before launching the next run or giving a final summary. This includes completed runs, NaN/diverged runs, crashes, and manually stopped runs. Record enough information to reconstruct and compare the run, including at least run id/path, date, git commit, exact command, optimizer, key hyperparameters, max steps, best/final validation loss when available, `step_to_3_28` when reached, divergence/crash status, wall/train time, hardware, and notes.
+
+After every meaningful experiment result or tuning decision, also update `experiment_handoff.md` in place with a concise summary of the new result, its interpretation, and any changed recommendation for the next run. Do not create dated replacement handoff files unless explicitly requested; keep this stable filename current for future Codex sessions.
 
 If a run fails before producing a validation result, still append a row with `diverged` or failure notes set appropriately and leave unavailable numeric fields blank.
 
@@ -161,6 +168,7 @@ For final benchmark claims:
 - Preserve the existing validation log format:
   `step:<step>/<train_steps> val_loss:<loss> train_time:<seconds>s step_avg:<ms>ms`
 - After each real training run, update `records/track_3_optimization/tuning_log.csv` with one row for that run before launching another run.
+- After each meaningful real training result, update `records/track_3_optimization/experiment_handoff.md` with the concise result summary and next-decision context.
 - Sweep records should include script name, exact config diff from base, number of trials, GPU count/model, PyTorch/CUDA version from logs, log paths, final loss per run, mean/std final loss, and total training time.
 - Archive important completed logs under `records/track_3_optimization/results/` only when explicitly asked.
 
@@ -188,6 +196,7 @@ Always report all attempted runs in the sweep, not just the best result.
 - `records/track_3_optimization/train_gpt_simple.py` - Muon baseline training script.
 - `records/track_3_optimization/train_gpt_simple_leon.py` - current Leon optimizer experiment target.
 - `records/track_3_optimization/tuning_log.csv` - cumulative local tuning ledger; read before new runs and append after each run finishes.
+- `records/track_3_optimization/experiment_handoff.md` - concise human-readable experiment summary; read before new runs and update after meaningful results.
 - `records/track_3_optimization/training_summary.md` - local run summaries.
 - `records/track_3_optimization/optimization_summary.md` - architecture/optimizer/tuning summary.
 - `records/track_3_optimization/make_figure.py` and `figure.png` - plots selected result logs.
@@ -199,6 +208,7 @@ Always report all attempted runs in the sweep, not just the best result.
 
 - If training or GPU jobs were launched, the user explicitly requested execution, the exact commands were shown, dry-run behavior was used when available, and all log paths were reported.
 - If any training run finished, crashed, diverged, or was stopped, `records/track_3_optimization/tuning_log.csv` was updated with a new row before final response.
+- If any meaningful new experiment result or tuning decision was produced, `records/track_3_optimization/experiment_handoff.md` was updated before final response.
 - Base config values and optimizer math are preserved unless the user requested changes.
 - Any edits are scoped to the requested experiment workflow.
 - Unsupported commands are marked `TODO` rather than invented.

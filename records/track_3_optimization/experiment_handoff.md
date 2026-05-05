@@ -2,11 +2,11 @@
 
 Last updated: 2026-05-05 10:15 America/Chicago
 
-This file summarizes the experiments from the recent Codex tuning conversation. The authoritative run ledger remains `records/track_3_optimization/tuning_log.csv`; use this file as a fast orientation layer before selecting the next run.
+This stable handoff file summarizes the experiments from the recent Codex tuning conversation. The authoritative run ledger remains `records/track_3_optimization/tuning_log.csv`; use this file as a fast orientation layer before selecting the next run, and update it in place after meaningful new results.
 
 ## Operating Notes
 
-- Read `records/track_3_optimization/AGENTS.md` and `records/track_3_optimization/tuning_log.csv` before launching new runs.
+- Read `records/track_3_optimization/AGENTS.md`, `records/track_3_optimization/tuning_log.csv`, and this handoff before launching new runs.
 - Append one row to `tuning_log.csv` immediately after each completed, failed, or crashed run.
 - Keep experiment artifacts committed periodically. Relevant artifacts include `tuning_log.csv`, run directories, metadata/configs, and logs needed for reproducibility.
 - User granted permission for 30 GPU launches without further confirmation so long as GPUs are available. The latest Muon Leon-NS rerun was tracked as run 12 of that allowance in this conversation context.
@@ -83,4 +83,3 @@ Interpretation:
 | --- | --- |
 | `1569f5ec617e57090aecbc37416223b5ddff678f` | Recorded Muon Leon-NS baseline, including modified Muon script, run archive, and CSV row. |
 | `04bfad78e01c8c514a5396201d7baaf8b0e29cfc` | Last commit before the Muon Leon-NS baseline record. |
-
