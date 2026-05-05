@@ -1,0 +1,6 @@
+{
+  "leon_cooldown_frac": 0.6,
+  "leon_lr": 0.035,
+  "leon_wd": 0.02,
+  "train_steps": 1500
+}

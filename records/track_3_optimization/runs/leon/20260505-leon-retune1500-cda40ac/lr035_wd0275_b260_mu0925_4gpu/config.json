@@ -1,0 +1,28 @@
+{
+  "adam_betas": [
+    0.8,
+    0.95
+  ],
+  "adam_cooldown_frac": 0.7,
+  "adam_eps": 1e-10,
+  "adam_wd": 0.0,
+  "embed_lr": 0.3,
+  "leon_beta2": 0.6,
+  "leon_cooldown_frac": 0.6,
+  "leon_diag_interval": 125,
+  "leon_diag_patterns": [
+    "blocks.0.attn.q.weight",
+    "blocks.6.mlp.proj.weight",
+    "blocks.11.attn.proj.weight"
+  ],
+  "leon_eps": 1e-09,
+  "leon_l_scale": 1.0,
+  "leon_log_diagnostics": false,
+  "leon_lr": 0.035,
+  "leon_mu": 0.925,
+  "leon_ns_iters": 6,
+  "leon_wd": 0.0275,
+  "proj_lr": 0.003125,
+  "scalar_lr": 0.01,
+  "train_steps": 1500
+}

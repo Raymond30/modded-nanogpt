@@ -1,0 +1,43 @@
+{
+  "argv": [
+    "records/track_3_optimization/train_gpt_simple_leon.py",
+    "--dry-run",
+    "--trials",
+    "1",
+    "--out-dir",
+    "records/track_3_optimization/runs/leon/20260505-leon-retune1500-cda40ac/lr035_4gpu",
+    "--set",
+    "train_steps=1500",
+    "--set",
+    "leon_lr=0.035",
+    "--set",
+    "leon_wd=0.03",
+    "--set",
+    "leon_cooldown_frac=0.6",
+    "--set",
+    "adam_cooldown_frac=0.7",
+    "--set",
+    "leon_mu=0.95",
+    "--set",
+    "leon_beta2=0.7",
+    "--set",
+    "leon_ns_iters=6",
+    "--set",
+    "leon_eps=1e-9",
+    "--set",
+    "leon_l_scale=1.0"
+  ],
+  "cuda_version": null,
+  "cwd": "/mnt/nas/rj23424/modded-nanogpt",
+  "dry_run": true,
+  "git_commit": "cda40acc6f25059e08eaf4af1e904d4caee82c92",
+  "mode": "dry-run",
+  "out_dir": "records/track_3_optimization/runs/leon/20260505-leon-retune1500-cda40ac/lr035_4gpu",
+  "script": "records/track_3_optimization/train_gpt_simple_leon.py",
+  "shard_counts": {
+    "train_shards": 40,
+    "val_shards": 1
+  },
+  "torch_version": null,
+  "trials": 1
+}
