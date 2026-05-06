@@ -1,0 +1,8 @@
+{
+  "leon_beta2": 0.6,
+  "leon_cooldown_frac": 0.6,
+  "leon_l_scale_schedule": "linear_ramp",
+  "leon_lr": 0.035,
+  "leon_wd": 0.0275,
+  "train_steps": 1500
+}
