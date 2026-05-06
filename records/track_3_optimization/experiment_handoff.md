@@ -1,6 +1,6 @@
 # Track 3 Optimization Experiment Handoff
 
-Last updated: 2026-05-05 23:43 America/Chicago
+Last updated: 2026-05-06 00:00 America/Chicago
 
 This stable handoff file summarizes the experiments from the recent Codex tuning conversation. The authoritative run ledger remains `records/track_3_optimization/tuning_log.csv`; use this file as a fast orientation layer before selecting the next run, and update it in place after meaningful new results.
 
@@ -41,6 +41,7 @@ Interpretation:
 - The next lower beta2 probe, `leon_beta2=0.5` at the same center, finished at `3.44988`. That is `0.00051` worse than `beta2=0.6`, though still `0.00040` better than the old `beta2=0.7` center, so the beta2 bracket now points to a local optimum near `0.6`.
 - The first `leon_mu` probe from the current beta2 center, `leon_mu=0.925`, finished at `3.45394`. That is `0.00457` worse than the current best `mu=0.95` center, so the lower side is not promising and the sweep should move upward next.
 - The first scheduled-`L` run, `leon_l_scale_schedule=linear_ramp` with a `0.2 -> 0.6` training-fraction ramp from `0` to `1`, finished at `3.44971`. That is only `0.00034` behind the constant full-`L` `beta2=0.6` best, but it trailed at every checkpoint and did not improve the current center.
+- The Muon-hparams late scheduled-`L` run, `leon_lr=0.025`, `leon_wd=0.025`, `leon_cooldown_frac=0.7`, and a `0.5 -> 0.8` ramp from `L=0` to full `L`, finished at `3.44939`. It beat the Leon `L=0` and Muon Leon-NS controls at several mid/late checkpoints after ramp activation, but final validation loss still trailed Leon `L=0` by `+0.00032`, Muon Leon-NS by `+0.00135`, original Muon by `+0.01860`, and the current best Leon screen by `+0.00002`.
 - The Muon Leon-NS rerun is better than tuned Leon by `0.06146`, but worse than original 12-step Muon by `0.01725`.
 - Leon with `L=0` and Muon hparams landed at `3.44907`, near-identical to Muon Leon-NS (`+0.00103` final val), indicating the earlier Leon gap was mainly from the nonzero second-momentum `L` contribution and tuned hparams rather than the optimizer wrapper.
 - The 500-step `leon_l_scale` diagnostic sweep was monotone: `0.0` final `3.79464`, `0.1` `3.87248`, `0.25` `3.93081`, `0.5` `3.99168`, `1.0` `4.04142`. Diagnostics show full `L` makes `tr(L)` about 98.8% of the normalization denominator at steps 125-375 and shrinks the update to about 16-17% of the hypothetical L=0 update.
@@ -65,6 +66,7 @@ Interpretation:
 | Unnormalized-sum full-L diagnostic | `lscale1_unnormsum_500_4gpu_diag` | Current code divides the Nesterov-updated `g` by `1-mu` and the second-momentum matrix by `1-beta2`. This largely removed the earlier scaling pathology for `l_scale=1.0`. |
 | Current-codepath 1500-step retune restart | `retune1500_lr035_retry_4gpu`, `retune1500_lr045_4gpu`, `retune1500_lr025_4gpu`, `retune1500_lr035_wd0275_4gpu`, `retune1500_lr035_wd025_4gpu`, `retune1500_lr035_wd0225_retry_4gpu`, `retune1500_lr035_wd020_4gpu`, `retune1500_lr035_wd0275_b260_4gpu`, `retune1500_lr035_wd0275_b250_4gpu`, `retune1500_lr035_wd0275_b260_mu0925_4gpu` | After avoiding dry-run `out-dir` reuse, the corrected screens established `lr=0.035` as the best LR center; `wd=0.0275` and `wd=0.0225` formed the effective WD tie, `beta2=0.6` produced a new best overall Leon run, `beta2=0.5` regressed slightly, and the first `mu` probe at `0.925` also regressed, suggesting `mu` should move upward from `0.95`. |
 | Leon `l_scale` schedule | `retune1500_lr035_wd0275_b260_mu095_ramp020060_retry_4gpu` | The 20%-60% linear ramp from `L=0` to full `L` was close but negative: final `3.44971`, worse than the constant full-`L` `beta2=0.6` center by `+0.00034`, and slower at every validation checkpoint. |
+| Muon-hparams `l_scale` schedule | `retune1500_lr025_wd025_b270_mu095_ramp050080_4gpu` | Using Muon-like hparams and delaying the ramp to 50%-80% gave a transient mid/late gain over Leon `L=0` and Muon Leon-NS, but final `3.44939` was still slightly worse than those controls and essentially tied with the best tuned Leon screen. |
 
 ## Detailed Results
 
@@ -114,12 +116,13 @@ Interpretation:
 | `retune1500_lr035_wd0275_b250_4gpu` | Leon | current codepath, `lr=0.035`, `wd=0.0275`, `cd=0.6`, `beta2=0.5` | 3.44988 | no | Second beta2 sweep point; regressed versus `beta2=0.6` by `+0.00051` but still improved the old `beta2=0.7` center by `-0.00040`. |
 | `retune1500_lr035_wd0275_b260_mu0925_4gpu` | Leon | current codepath, `lr=0.035`, `wd=0.0275`, `cd=0.6`, `beta2=0.6`, `mu=0.925` | 3.45394 | no | First mu sweep point; regressed versus the current `mu=0.95` center by `+0.00457`, so the lower side is not promising. |
 | `retune1500_lr035_wd0275_b260_mu095_ramp020060_retry_4gpu` | Leon | current codepath, `lr=0.035`, `wd=0.0275`, `cd=0.6`, `beta2=0.6`, `mu=0.95`, `leon_l_scale_schedule=linear_ramp`, ramp `0.2 -> 0.6` | 3.44971 | no | Scheduled-`L` run was close but negative: final trailed the constant full-`L` best by `+0.00034` and did not reach `3.28`. |
+| `retune1500_lr025_wd025_b270_mu095_ramp050080_4gpu` | Leon | current codepath, Muon-like hparams `lr=0.025`, `wd=0.025`, `cd=0.7`, `beta2=0.7`, `mu=0.95`, `leon_l_scale_schedule=linear_ramp`, ramp `0.5 -> 0.8` | 3.44939 | no | Late scheduled-`L` run briefly improved over Leon `L=0` and Muon Leon-NS after activation, but final trailed Leon `L=0` by `+0.00032` and Muon Leon-NS by `+0.00135`; original Muon remained much better. |
 
 ## Next Recommended Steps
 
 1. Treat `leon_lr=0.035`, `leon_wd=0.0275`, `leon_cooldown_frac=0.6`, `leon_beta2=0.6` as the current best-tested Leon center on the active codepath.
 2. The tested current-codepath LR ordering is `0.035` best, `0.025` second, and `0.045` third at `wd=0.03`; the tested WD ordering around the `0.035` LR center is `0.0275` and `0.0225` essentially tied, then `0.02`, then `0.03`, then `0.025`.
-3. The 20%-60% `leon_l_scale` linear ramp did not improve the current best center. If continuing schedules, test a later/shorter ramp only as an algorithm probe; for immediate tuning, the more informative next run remains an upper-side `leon_mu=0.975` follow-up with the best center unchanged otherwise.
+3. The `leon_l_scale` schedules tested so far have not improved final validation loss. The Muon-hparams `0.5 -> 0.8` ramp suggests delayed `L` can help mid-training, but full `L` appears to give back the gain by the final checkpoint. If continuing schedule probes, prefer a partial target such as `leon_l_scale=0.5` with the same late ramp, or a later ramp that reaches full `L` only near the end.
 4. If comparing against Muon, keep both Muon baselines in view: original 12-step Muon is the stronger reference, while Muon Leon-NS isolates part of the orthogonalization change.
 5. For algorithm attribution, the Leon L=0 control plus the L-scale sweep are the strongest evidence so far: L=0 reproduces Muon Leon-NS nearly exactly, and increasing `L` scale monotonically slows the 500-step trajectory.
 6. If continuing algorithm work on nonzero `L`, do not use full `L` unchanged. Test mechanisms that keep `tr(L)` from dominating normalization, such as much smaller scale, lower `beta2`, delayed activation, clipping/normalizing `tr(L)`, or computing Gram statistics from the same Nesterov update being orthogonalized.
