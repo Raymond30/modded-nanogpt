@@ -1,0 +1,7 @@
+{
+  "leon_l_scale_ramp_end_frac": 0.7,
+  "leon_l_scale_ramp_start_frac": 0.4,
+  "leon_l_scale_schedule": "linear_ramp",
+  "leon_lr": 0.0275,
+  "train_steps": 1500
+}
