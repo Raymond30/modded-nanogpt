@@ -43,6 +43,7 @@ BASE_HPARAMS = dict(
     leon_ns_iters       = 6,
     leon_eps            = 1e-9,
     leon_l_scale        = 1.0,
+    leon_orthogonalize_dtype = "bfloat16",
     leon_l_scale_schedule = "constant",
     leon_l_scale_ramp_start_frac = 0.2,
     leon_l_scale_ramp_end_frac = 0.6,
@@ -99,6 +100,13 @@ def validate_hparams(hparams):
     l_scale = float(hparams["leon_l_scale"])
     if l_scale < 0:
         raise ValueError(f"leon_l_scale must be non-negative, got {l_scale!r}")
+
+    orthogonalize_dtype = hparams["leon_orthogonalize_dtype"]
+    if orthogonalize_dtype not in ("bfloat16", "float32"):
+        raise ValueError(
+            "leon_orthogonalize_dtype must be 'bfloat16' or 'float32', "
+            f"got {orthogonalize_dtype!r}"
+        )
 
     schedule = hparams["leon_l_scale_schedule"]
     if schedule not in ("constant", "linear_ramp"):
@@ -348,10 +356,19 @@ class GPT(nn.Module):
 #              Optimizer               #
 ########################################
 
+def leon_compute_dtype(dtype_name: str):
+    if dtype_name == "bfloat16":
+        return torch.bfloat16
+    if dtype_name == "float32":
+        return torch.float32
+    raise ValueError(f"Unsupported Leon orthogonalization dtype: {dtype_name!r}")
+
+
 def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_buffer: Tensor,
                        momentum: float = 0.95, beta2: float = 0.7,
                        ns_iters: int = 6, ns_coeffs: tuple = (2, -1.5, 0.5),
-                       eps: float = 1e-7, l_scale: float = 1.0) -> Tensor:
+                       eps: float = 1e-7, l_scale: float = 1.0,
+                       compute_dtype: str = "bfloat16") -> Tensor:
     """
     Leon update: Nesterov momentum + Newton-Schulz orthogonalization with
     augmented Gram matrix (second momentum buffer).
@@ -369,6 +386,7 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
         ns_coeffs: (a, b, c) coefficients for the NS iteration
         eps: Diagonal stability epsilon added to the augmented Gram matrix
         l_scale: Multiplier for the second-momentum Gram contribution
+        compute_dtype: Matrix-update dtype for X inside the NS iteration
     """
     is_tall = grad.size(-2) >= grad.size(-1)
 
@@ -386,7 +404,7 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
     # 2. Update second momentum (Gram EMA)
     second_momentum_buffer.lerp_(gram_tmp, 1 - beta2)
 
-    X = g.bfloat16()
+    X = g.to(dtype=leon_compute_dtype(compute_dtype))
     second_momentum_for_update = second_momentum_buffer.float() / (1 - beta2)
     L = second_momentum_for_update * l_scale
     A = 0.5 * (L + L.transpose(-2, -1))  # ensure symmetry
@@ -441,11 +459,12 @@ class Leon(torch.optim.Optimizer):
     the iteration matrix: A = X@X^T + L. A is also iterated alongside X.
     """
     def __init__(self, params, lr=0.025, weight_decay=0.025, mu=0.95, beta2=0.7,
-                 ns_iters=6, eps=1e-7, l_scale=1.0):
+                 ns_iters=6, eps=1e-7, l_scale=1.0, orthogonalize_dtype="bfloat16"):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, beta2=beta2,
-                        ns_iters=ns_iters, eps=eps, l_scale=l_scale)
+                        ns_iters=ns_iters, eps=eps, l_scale=l_scale,
+                        orthogonalize_dtype=orthogonalize_dtype)
         super().__init__(params, defaults)
         self.param_names = {}
 
@@ -490,6 +509,7 @@ class Leon(torch.optim.Optimizer):
                         momentum=group["mu"], beta2=group["beta2"],
                         ns_iters=group["ns_iters"], eps=group["eps"],
                         l_scale=group["l_scale"],
+                        compute_dtype=group["orthogonalize_dtype"],
                     )
                     update *= max(1, p.size(-2) / p.size(-1))**0.5
 
@@ -500,6 +520,7 @@ class Leon(torch.optim.Optimizer):
                         momentum=group["mu"], beta2=group["beta2"],
                         ns_iters=group["ns_iters"], eps=group["eps"],
                         l_scale=0.0,
+                        compute_dtype=group["orthogonalize_dtype"],
                     )
                     update_l0 *= max(1, p.size(-2) / p.size(-1))**0.5
 
@@ -523,7 +544,9 @@ class Leon(torch.optim.Optimizer):
                     l_sym = 0.5 * (l_for_stats + l_for_stats.transpose(-2, -1))
                     l_trace = l_sym.diagonal(dim1=-2, dim2=-1).sum().clamp_min(0)
                     l_fro = l_sym.norm()
-                    g_sq = grad_for_update.bfloat16().float().pow(2).sum()
+                    g_sq = grad_for_update.to(
+                        dtype=leon_compute_dtype(group["orthogonalize_dtype"])
+                    ).float().pow(2).sum()
                     scaled_l_trace = group["l_scale"] * l_trace
                     l_trace_fraction = scaled_l_trace / (g_sq + scaled_l_trace).clamp_min(1e-12)
                     if l_trace > 0:
@@ -582,6 +605,7 @@ class Leon(torch.optim.Optimizer):
                         momentum=group["mu"], beta2=group["beta2"],
                         ns_iters=group["ns_iters"], eps=group["eps"],
                         l_scale=group["l_scale"],
+                        compute_dtype=group["orthogonalize_dtype"],
                     )
                     update *= max(1, p.size(-2) / p.size(-1))**0.5
                     p.mul_(1 - group["lr"] * group["weight_decay"])
@@ -693,7 +717,8 @@ def main():
                               lr=hparams["leon_lr"], weight_decay=hparams["leon_wd"],
                               mu=hparams["leon_mu"], beta2=hparams["leon_beta2"],
                               ns_iters=hparams["leon_ns_iters"], eps=hparams["leon_eps"],
-                              l_scale=hparams["leon_l_scale"])
+                              l_scale=hparams["leon_l_scale"],
+                              orthogonalize_dtype=hparams["leon_orthogonalize_dtype"])
             optimizer2.param_names = {p: name for name, p in model.named_parameters()}
             optimizers = [optimizer1, optimizer2]
             assert set(p for opt in optimizers for group in opt.param_groups
