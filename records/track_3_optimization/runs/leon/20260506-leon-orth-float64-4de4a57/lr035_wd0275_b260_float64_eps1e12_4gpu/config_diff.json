@@ -1,0 +1,9 @@
+{
+  "leon_beta2": 0.6,
+  "leon_cooldown_frac": 0.6,
+  "leon_eps": 1e-12,
+  "leon_lr": 0.035,
+  "leon_orthogonalize_dtype": "float64",
+  "leon_wd": 0.0275,
+  "train_steps": 1500
+}
