@@ -1,6 +1,6 @@
 # Track 3 Optimization Experiment Handoff
 
-Last updated: 2026-05-06 14:18 America/Chicago
+Last updated: 2026-05-06 14:51 America/Chicago
 
 This stable handoff file summarizes the experiments from the recent Codex tuning conversation. The authoritative run ledger remains `records/track_3_optimization/tuning_log.csv`; use this file as a fast orientation layer before selecting the next run, and update it in place after meaningful new results.
 
@@ -12,15 +12,17 @@ This stable handoff file summarizes the experiments from the recent Codex tuning
 - Do not reuse the same `--out-dir` for a dry-run and the real launch. `train_gpt_simple_leon.py` creates the run directory with `exist_ok=False` in both modes, so a dry-run can leave a stale directory that causes the subsequent real `torchrun` launch to hang after distributed init without ever creating `train.log`.
 - User granted permission for 30 GPU launches without further confirmation so long as GPUs are available. The latest completed diagnostic sweep consumed runs 14-20 of that allowance in this conversation context. One additional sandbox retry failed before using GPUs.
 - Current 30-run schedule/LR probe is predeclared around Muon-like hparams: `leon_wd=0.025`, `leon_mu=0.95`, `leon_beta2=0.7`, `leon_cooldown_frac=0.7`, `adam_cooldown_frac=0.7`, `train_steps=1500`; sweep `leon_lr in {0.0225, 0.025, 0.0275, 0.03, 0.035}` and ramp windows `{0.3->0.6, 0.4->0.7, 0.5->0.8, 0.6->0.9, 0.7->0.9, 0.8->0.95}`, skipping the already-completed duplicate `lr=0.025,ramp=0.5->0.8` and replacing it with `lr=0.025,ramp=0.6->0.95`.
-- Main screening runs used `train_steps=1500`; the L-scale diagnostic sweep used `train_steps=500`. No logged run reached `val_loss < 3.28`.
+- Main screening runs used `train_steps=1500`; the L-scale diagnostic sweep used `train_steps=500`. The first logged Leon run to reach `val_loss < 3.28` is now the 3375-step float32 12-step benchmark rerun, and it crossed only at the final checkpoint.
 - Many later 1500-step screens used 2 GPUs because only GPUs 1 and 2 were available, while the latest diagnostics used 4 GPUs. Do not compare wall time directly between 4-GPU and 2-GPU runs.
 - A historical bias-correction branch was tried briefly, but the active code has now switched away from it and instead uses unnormalized exponential-sum scaling for the Leon moments.
 - The latest bf16 12-step orthogonalization probe diverged to NaNs at validation checkpoints starting at step 125 and was terminated after step 644. Treat it as a failed attribution run, not as a comparison point against the successful float32/float64 12-step probes.
+- The first fixed-budget 3375-step rerun of the current best Leon screen finished at `3.27879` and reached `val_loss < 3.28` for the first time in the local Leon ledger, but only at the final checkpoint `step 3375`.
 
 ## Current Bests
 
 | Category | Run | Key hparams | Final val loss | Run path |
 | --- | --- | --- | ---: | --- |
+| Best Leon 3375-step benchmark | `leon_orth_float32_lr035_wd0275_b260_eps1e12_ns12_3375_4gpu` | `train_steps=3375`, `leon_lr=0.035`, `leon_wd=0.0275`, `leon_cooldown_frac=0.6`, `leon_beta2=0.6`, `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, `leon_eps=1e-12` | 3.27879 | `records/track_3_optimization/runs/leon/20260506-leon-best3375-f1a09dd/lr035_wd0275_b260_float32_eps1e12_ns12_3375_4gpu` |
 | Best Leon screen | `leon_orth_float32_lr035_wd0275_b260_eps1e12_ns12_4gpu` | `leon_lr=0.035`, `leon_wd=0.0275`, `leon_cooldown_frac=0.6`, `leon_beta2=0.6`, `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, `leon_eps=1e-12` | 3.42975 | `records/track_3_optimization/runs/leon/20260506-leon-orth-float32-4b57bc8/lr035_wd0275_b260_float32_eps1e12_ns12_4gpu` |
 | Best 6-step bf16 constant full-L Leon reference | `retune1500_lr035_wd0275_b260_4gpu` | `leon_lr=0.035`, `leon_wd=0.0275`, `leon_cooldown_frac=0.6`, `leon_beta2=0.6`, current codepath | 3.44937 | `records/track_3_optimization/runs/leon/20260505-leon-retune1500-cda40ac/lr035_wd0275_b260_4gpu` |
 | Best original Muon baseline | `muon1500_2gpu` | `lr=0.025`, `wd=0.025`, `momentum=0.95`, `ns_steps=12` | 3.43079 | `records/track_3_optimization/runs/muon/20260504-muon-screen1500` |
@@ -32,6 +34,8 @@ This stable handoff file summarizes the experiments from the recent Codex tuning
 
 Interpretation:
 
+- The new 3375-step Leon benchmark run, `leon_orth_float32_lr035_wd0275_b260_eps1e12_ns12_3375_4gpu`, finished at `3.27879` and crossed the `3.28` threshold exactly at the final checkpoint `step 3375`. This is the first Leon run in the local ledger to reach the benchmark target.
+- Against the local `train_gpt_simple.py` Muon single-run summary in `training_summary.md`, Leon is `-0.00019` lower in final validation loss (`3.27879` vs `3.27898`) on the same 3375-step budget. That is a fixed-budget head-to-head only; it does not yet establish a better threshold-crossing distribution because Leon crossed only at the last checkpoint and repeated trials are still missing.
 - The float32 12-step Newton-Schulz follow-up, `leon_orth_float32_lr035_wd0275_b260_eps1e12_ns12_4gpu`, finished at `3.42975`. That beats the 6-step bf16 reference by `-0.01962`, the float64 12-step probe by `-0.00064`, the best prior Leon schedule by `-0.01678`, and the original `muon1500_2gpu` baseline by `-0.00104`; it still did not reach `val_loss < 3.28`.
 - The prior float64 12-step run finished at `3.43039`, so double precision is unnecessary for the observed 12-step gain in this single attribution run. Runtime did not improve with float32 here (`732.027s` train time vs `725.158s` for float64), so treat speed as noise/implementation-dependent until repeated.
 - On the current unnormalized-sum codepath, the first corrected 1500-step retune point `leon_lr=0.035`, `leon_wd=0.03`, `leon_cooldown_frac=0.6` reached `3.45093`, improving the prior best tuned Leon screen by `-0.05857`.
@@ -145,7 +149,7 @@ Interpretation:
 
 ## Next Recommended Steps
 
-1. Treat `leon_lr=0.035`, `leon_wd=0.0275`, `leon_cooldown_frac=0.6`, `leon_beta2=0.6`, `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, and `leon_eps=1e-12` as the current best single Leon result. For the 6-step bf16 schedule branch, the best center remains `leon_lr=0.0275`, `leon_wd=0.025`, `leon_cooldown_frac=0.7`, `leon_beta2=0.7`, ramp `0.5 -> 0.8`.
+1. Treat `leon_lr=0.035`, `leon_wd=0.0275`, `leon_cooldown_frac=0.6`, `leon_beta2=0.6`, `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, and `leon_eps=1e-12` as the current best Leon setting. The 3375-step run with this config is now the local fixed-budget Leon benchmark reference and reaches `3.28` exactly at step `3375`. For the 6-step bf16 schedule branch, the best center remains `leon_lr=0.0275`, `leon_wd=0.025`, `leon_cooldown_frac=0.7`, `leon_beta2=0.7`, ramp `0.5 -> 0.8`.
 2. The tested current-codepath LR ordering is `0.035` best, `0.025` second, and `0.045` third at `wd=0.03`; the tested WD ordering around the `0.035` LR center is `0.0275` and `0.0225` essentially tied, then `0.02`, then `0.03`, then `0.025`.
 3. The schedule has now improved over tuned Leon-family baselines but not original Muon. Since `lr=0.03,ramp=0.5->0.8`, `lr=0.0275,ramp=0.6->0.9`, and `lr=0.0275,ramp=0.4->0.7` all regressed versus the `0.5->0.8` center, keep `0.5->0.8` as the timing center and use the remaining declared-grid probes to test whether shorter late windows or lower/higher LR interactions can improve it.
 4. If comparing against Muon, keep both Muon baselines in view: original 12-step Muon is the stronger reference, while Muon Leon-NS isolates part of the orthogonalization change. The 12-step float32 run already isolates `leon_ns_iters=12` from double precision; the next clean attribution run would isolate `eps` by trying float32, 12 steps, and `leon_eps=1e-9`.
@@ -153,7 +157,7 @@ Interpretation:
 6. If continuing algorithm work on nonzero `L`, do not use full `L` unchanged. Test mechanisms that keep `tr(L)` from dominating normalization, such as much smaller scale, lower `beta2`, delayed activation, clipping/normalizing `tr(L)`, or computing Gram statistics from the same Nesterov update being orthogonalized.
 7. The next algorithm comparison should use the current unnormalized exponential-sum codepath rather than the abandoned bias-correction branch.
 8. Since `l_scale=1.0` is now close to the old `L=0` control, rerun the `l_scale` sweep on the current codepath if you want to know whether nonzero `L` is still helpful, neutral, or slightly harmful after the scaling fix.
-9. Before making benchmark claims, run independent trials for promising configs and report mean/std plus threshold behavior, per `AGENTS.md`.
+9. Before making benchmark claims, run independent trials for the new 3375-step Leon benchmark config and report mean/std plus threshold behavior, per `AGENTS.md`. The single fixed-budget head-to-head against `train_gpt_simple.py` is promising but not yet statistically sufficient.
 
 ## Important Commits
 
