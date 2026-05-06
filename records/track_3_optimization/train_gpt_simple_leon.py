@@ -102,9 +102,9 @@ def validate_hparams(hparams):
         raise ValueError(f"leon_l_scale must be non-negative, got {l_scale!r}")
 
     orthogonalize_dtype = hparams["leon_orthogonalize_dtype"]
-    if orthogonalize_dtype not in ("bfloat16", "float32"):
+    if orthogonalize_dtype not in ("bfloat16", "float32", "float64"):
         raise ValueError(
-            "leon_orthogonalize_dtype must be 'bfloat16' or 'float32', "
+            "leon_orthogonalize_dtype must be 'bfloat16', 'float32', or 'float64', "
             f"got {orthogonalize_dtype!r}"
         )
 
@@ -361,7 +361,13 @@ def leon_compute_dtype(dtype_name: str):
         return torch.bfloat16
     if dtype_name == "float32":
         return torch.float32
+    if dtype_name == "float64":
+        return torch.float64
     raise ValueError(f"Unsupported Leon orthogonalization dtype: {dtype_name!r}")
+
+
+def leon_accum_dtype(dtype_name: str):
+    return torch.float64 if dtype_name == "float64" else torch.float32
 
 
 def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_buffer: Tensor,
@@ -389,6 +395,8 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
         compute_dtype: Matrix-update dtype for X inside the NS iteration
     """
     is_tall = grad.size(-2) >= grad.size(-1)
+    x_dtype = leon_compute_dtype(compute_dtype)
+    accum_dtype = leon_accum_dtype(compute_dtype)
 
     # 0. Compute Gram matrix of raw gradient BEFORE mutating it with momentum
     if is_tall:
@@ -404,13 +412,13 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
     # 2. Update second momentum (Gram EMA)
     second_momentum_buffer.lerp_(gram_tmp, 1 - beta2)
 
-    X = g.to(dtype=leon_compute_dtype(compute_dtype))
-    second_momentum_for_update = second_momentum_buffer.float() / (1 - beta2)
+    X = g.to(dtype=x_dtype)
+    second_momentum_for_update = second_momentum_buffer.to(dtype=accum_dtype) / (1 - beta2)
     L = second_momentum_for_update * l_scale
     A = 0.5 * (L + L.transpose(-2, -1))  # ensure symmetry
 
     # 3. Scale so that tr(GG^T + L) ≈ 1
-    tr = X.float().pow(2).sum(dim=(-2, -1), keepdim=True) \
+    tr = X.to(dtype=accum_dtype).pow(2).sum(dim=(-2, -1), keepdim=True) \
        + A.diagonal(dim1=-2, dim2=-1).sum(dim=-1, keepdim=True).unsqueeze(-1)
     tr = tr.clamp_min(1e-12) * ((1 + 2e-2)**2)  # safety cushion
 
@@ -544,9 +552,8 @@ class Leon(torch.optim.Optimizer):
                     l_sym = 0.5 * (l_for_stats + l_for_stats.transpose(-2, -1))
                     l_trace = l_sym.diagonal(dim1=-2, dim2=-1).sum().clamp_min(0)
                     l_fro = l_sym.norm()
-                    g_sq = grad_for_update.to(
-                        dtype=leon_compute_dtype(group["orthogonalize_dtype"])
-                    ).float().pow(2).sum()
+                    diagnostic_accum_dtype = leon_accum_dtype(group["orthogonalize_dtype"])
+                    g_sq = grad_for_update.to(dtype=diagnostic_accum_dtype).pow(2).sum()
                     scaled_l_trace = group["l_scale"] * l_trace
                     l_trace_fraction = scaled_l_trace / (g_sq + scaled_l_trace).clamp_min(1e-12)
                     if l_trace > 0:
