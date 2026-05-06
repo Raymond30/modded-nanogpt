@@ -1,6 +1,6 @@
 # Track 3 Optimization Experiment Handoff
 
-Last updated: 2026-05-06 13:52 America/Chicago
+Last updated: 2026-05-06 14:18 America/Chicago
 
 This stable handoff file summarizes the experiments from the recent Codex tuning conversation. The authoritative run ledger remains `records/track_3_optimization/tuning_log.csv`; use this file as a fast orientation layer before selecting the next run, and update it in place after meaningful new results.
 
@@ -15,6 +15,7 @@ This stable handoff file summarizes the experiments from the recent Codex tuning
 - Main screening runs used `train_steps=1500`; the L-scale diagnostic sweep used `train_steps=500`. No logged run reached `val_loss < 3.28`.
 - Many later 1500-step screens used 2 GPUs because only GPUs 1 and 2 were available, while the latest diagnostics used 4 GPUs. Do not compare wall time directly between 4-GPU and 2-GPU runs.
 - A historical bias-correction branch was tried briefly, but the active code has now switched away from it and instead uses unnormalized exponential-sum scaling for the Leon moments.
+- The latest bf16 12-step orthogonalization probe diverged to NaNs at validation checkpoints starting at step 125 and was terminated after step 644. Treat it as a failed attribution run, not as a comparison point against the successful float32/float64 12-step probes.
 
 ## Current Bests
 
