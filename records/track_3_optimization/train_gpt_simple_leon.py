@@ -43,6 +43,9 @@ BASE_HPARAMS = dict(
     leon_ns_iters       = 6,
     leon_eps            = 1e-9,
     leon_l_scale        = 1.0,
+    leon_l_scale_schedule = "constant",
+    leon_l_scale_ramp_start_frac = 0.2,
+    leon_l_scale_ramp_end_frac = 0.6,
     leon_log_diagnostics = False,
     leon_diag_interval  = 125,
     leon_diag_patterns  = (
@@ -90,6 +93,46 @@ def resolve_hparams(overrides):
 
 def config_diff(hparams):
     return {k: v for k, v in hparams.items() if BASE_HPARAMS.get(k) != v}
+
+
+def validate_hparams(hparams):
+    l_scale = float(hparams["leon_l_scale"])
+    if l_scale < 0:
+        raise ValueError(f"leon_l_scale must be non-negative, got {l_scale!r}")
+
+    schedule = hparams["leon_l_scale_schedule"]
+    if schedule not in ("constant", "linear_ramp"):
+        raise ValueError(
+            "leon_l_scale_schedule must be 'constant' or 'linear_ramp', "
+            f"got {schedule!r}"
+        )
+
+    if schedule == "linear_ramp":
+        start = float(hparams["leon_l_scale_ramp_start_frac"])
+        end = float(hparams["leon_l_scale_ramp_end_frac"])
+        if not (0 <= start < end <= 1):
+            raise ValueError(
+                "linear_ramp requires 0 <= leon_l_scale_ramp_start_frac "
+                "< leon_l_scale_ramp_end_frac <= 1, "
+                f"got start={start!r}, end={end!r}"
+            )
+
+
+def scheduled_l_scale(hparams, progress):
+    target = float(hparams["leon_l_scale"])
+    schedule = hparams["leon_l_scale_schedule"]
+
+    if schedule == "constant":
+        return target
+
+    start = float(hparams["leon_l_scale_ramp_start_frac"])
+    end = float(hparams["leon_l_scale_ramp_end_frac"])
+    if progress < start:
+        return 0.0
+    if progress >= end:
+        return target
+    ramp_progress = (progress - start) / (end - start)
+    return target * ramp_progress
 
 
 def default_run_dir():
@@ -151,6 +194,7 @@ def write_run_files(run_dir, args, hparams, mode, extra=None):
 if "--dry-run" in sys.argv:
     args = parse_args()
     hparams = resolve_hparams(args.set)
+    validate_hparams(hparams)
     run_dir = create_run_dir(args.out_dir)
     write_run_files(run_dir, args, hparams, "dry-run")
     print(f"dry_run:true out_dir:{run_dir}")
@@ -553,6 +597,7 @@ def main():
     args = parse_args()
     num_trials = args.trials if args.trials is not None else (args.legacy_trials or 1)
     hparams = resolve_hparams(args.set)
+    validate_hparams(hparams)
 
     if args.dry_run:
         run_dir = create_run_dir(args.out_dir)
@@ -660,6 +705,7 @@ def main():
                 group["cooldown_frac"] = hparams["adam_cooldown_frac"]
             for group in optimizer2.param_groups:
                 group["cooldown_frac"] = hparams["leon_cooldown_frac"]
+                group["l_scale"] = scheduled_l_scale(hparams, 0.0)
 
             # learning rate schedule: stable then decay
             def set_hparams(step):
@@ -673,6 +719,9 @@ def main():
                         else:
                             eta = (1 - progress) / cooldown_frac
                         group["lr"] = group["initial_lr"] * eta
+                l_scale = scheduled_l_scale(hparams, progress)
+                for group in optimizer2.param_groups:
+                    group["l_scale"] = l_scale
 
             def log_leon_diagnostics(step):
                 if not hparams["leon_log_diagnostics"]:
