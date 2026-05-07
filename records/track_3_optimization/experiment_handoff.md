@@ -1,6 +1,6 @@
 # Track 3 Optimization Experiment Handoff
 
-Last updated: 2026-05-06 14:51 America/Chicago
+Last updated: 2026-05-06 20:38 America/Chicago
 
 This stable handoff file summarizes the experiments from the recent Codex tuning conversation. The authoritative run ledger remains `records/track_3_optimization/tuning_log.csv`; use this file as a fast orientation layer before selecting the next run, and update it in place after meaningful new results.
 
@@ -64,6 +64,56 @@ Interpretation:
 - The 500-step `leon_l_scale` diagnostic sweep was monotone: `0.0` final `3.79464`, `0.1` `3.87248`, `0.25` `3.93081`, `0.5` `3.99168`, `1.0` `4.04142`. Diagnostics show full `L` makes `tr(L)` about 98.8% of the normalization denominator at steps 125-375 and shrinks the update to about 16-17% of the hypothetical L=0 update.
 - The old bias-corrected full-`L` follow-up was slightly worse than uncorrected full `L` (`4.05228` vs `4.04142`). The active code no longer uses that branch; it now scales Leon as an unnormalized exponential sum by dividing the Nesterov-updated `g` by `1 - mu` and the second-momentum matrix by `1 - beta2`.
 - The new full-`L` diagnostic on the current unnormalized-sum codepath improved sharply to `3.80020`. Its `l_trace_fraction` dropped to about `0.50 / 0.45 / 0.40` at steps `125 / 250 / 375`, and `update_norm / update_l0_norm` rose to about `0.78 / 0.80 / 0.83`, leaving full `L` only `+0.00556` behind the `L=0` control at step 500.
+
+## LR Sensitivity Sweep (2026-05-06)
+
+**Objective:** Test whether Leon is less sensitive to learning rate than Muon (user hypothesis).
+
+**Protocol:** Log-uniform sweep, factor-of-2 spacing, 5 points each, 3375 steps, 4× H100 NVL. Leon centered on best known LR (0.035); Muon centered on baseline LR (0.025). All other hparams fixed at each optimizer's best known values. Leon optimal (lr=0.035) reused from previous run.
+
+### Leon LR sweep (best config: wd=0.0275, beta2=0.6, ns=12, float32, eps=1e-12, cd=0.6)
+
+| LR | vs optimal | Final val | Δ | Reached 3.28 | Run path |
+| --- | --- | ---: | ---: | --- | --- |
+| 0.00875 | 4× below | 3.29982 | +0.02103 | No | `runs/leon/20260506-lr-sensitivity/leon_lr00875_4gpu` |
+| 0.0175 | 2× below | 3.28451 | +0.00572 | No | `runs/leon/20260506-lr-sensitivity/leon_lr0175_4gpu` |
+| **0.035** | **optimal** | **3.27879** | **0** | **Yes (step 3375)** | `runs/leon/20260506-leon-best3375-f1a09dd/…` |
+| 0.070 | 2× above | 3.29345 | +0.01466 | No | `runs/leon/20260506-lr-sensitivity/leon_lr070_4gpu` |
+| 0.140 | 4× above | 3.32923 | +0.05044 | No | `runs/leon/20260506-lr-sensitivity/leon_lr140_4gpu` |
+
+### Muon LR sweep (default config: wd=0.025, ns=12-step bf16, cd=0.7)
+
+| LR | vs nominal | Final val | Δ | Reached 3.28 | Run path |
+| --- | --- | ---: | ---: | --- | --- |
+| 0.00625 | 4× below | 3.31013 | +0.03190 | No | `runs/muon/20260506-lr-sensitivity/muon_lr00625_4gpu` |
+| 0.0125 | 2× below | 3.28832 | +0.01009 | No | `runs/muon/20260506-lr-sensitivity/muon_lr0125_4gpu` |
+| **0.025** | **nominal** | **3.27823** | **0** | **Yes (step 3375)** | `runs/muon/20260506-lr-sensitivity/muon_lr025_4gpu` |
+| 0.050 | 2× above | 3.27758 | **−0.00065** | **Yes (step 3375)** | `runs/muon/20260506-lr-sensitivity/muon_lr050_4gpu` |
+| 0.100 | 4× above | 3.29988 | +0.02165 | No | `runs/muon/20260506-lr-sensitivity/muon_lr100_4gpu` |
+
+### Sensitivity comparison
+
+| Deviation | Leon Δ (low) | Leon Δ (high) | Muon Δ (low) | Muon Δ (high) |
+| --- | ---: | ---: | ---: | ---: |
+| 2× | +0.006 | +0.015 | +0.010 | **−0.001** |
+| 4× | +0.021 | **+0.050** | +0.032 | +0.022 |
+| Average (2×) | — | **+0.010** | — | **+0.005** |
+| Average (4×) | — | **+0.036** | — | **+0.027** |
+
+### Hypothesis verdict: NOT confirmed
+
+The data **does not support** the hypothesis that Leon is less sensitive to learning rate than Muon. The results show the opposite pattern:
+
+- **At 2× deviation**, Muon is less sensitive on average (+0.005) than Leon (+0.010). Muon lr=0.050 actually outperforms the nominal lr=0.025 by a small margin (−0.00065), suggesting the Muon optimum is flatter or right-shifted toward ~0.040–0.050.
+- **At 4× deviation**, Muon is also less sensitive on average (+0.027) than Leon (+0.036). Leon is particularly fragile on the high-LR side: lr=0.140 degrades by +0.050, nearly 2.5× the Muon high-side degradation of +0.022.
+- **Asymmetries differ**: Leon is more sensitive to high LR; Muon is somewhat more sensitive to low LR but is robust to moderate overshooting.
+
+**Important caveats:**
+- All results are single-run comparisons. Run-to-run variance (typically ~0.002–0.005 for 3375-step runs) could shift the ordering at small differences, especially for Muon lr=0.050 vs 0.025.
+- The Muon "nominal optimal" of 0.025 may be slightly below the true optimum (~0.040); this artificially makes the 2× high-side result look neutral or better.
+- The Leon and Muon configs differ in many ways beyond LR (NS iterations, weight decay, cooldown, beta2), so this is not a pure isolated comparison of LR sensitivity.
+
+**Practical take:** Muon's LR plateau is broad and right-skewed (stable from at least 0.0125 to 0.050). Leon's plateau is narrower and left-skewed (stable from ~0.0175 to ~0.070 with rapid degradation above). If anything, Muon is the more LR-robust of the two in this regime.
 
 ## Experiment Sequence
 
@@ -149,15 +199,16 @@ Interpretation:
 
 ## Next Recommended Steps
 
-1. Treat `leon_lr=0.035`, `leon_wd=0.0275`, `leon_cooldown_frac=0.6`, `leon_beta2=0.6`, `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, and `leon_eps=1e-12` as the current best Leon setting. The 3375-step run with this config is now the local fixed-budget Leon benchmark reference and reaches `3.28` exactly at step `3375`. For the 6-step bf16 schedule branch, the best center remains `leon_lr=0.0275`, `leon_wd=0.025`, `leon_cooldown_frac=0.7`, `leon_beta2=0.7`, ramp `0.5 -> 0.8`.
+1. Treat `leon_lr=0.035`, `leon_wd=0.0275`, `leon_cooldown_frac=0.6`, `leon_beta2=0.6`, `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, and `leon_eps=1e-12` as the current best Leon setting. The 3375-step run with this config is the local fixed-budget Leon benchmark reference and reaches `3.28` exactly at step `3375`. For the 6-step bf16 schedule branch, the best center remains `leon_lr=0.0275`, `leon_wd=0.025`, `leon_cooldown_frac=0.7`, `leon_beta2=0.7`, ramp `0.5 -> 0.8`.
 2. The tested current-codepath LR ordering is `0.035` best, `0.025` second, and `0.045` third at `wd=0.03`; the tested WD ordering around the `0.035` LR center is `0.0275` and `0.0225` essentially tied, then `0.02`, then `0.03`, then `0.025`.
-3. The schedule has now improved over tuned Leon-family baselines but not original Muon. Since `lr=0.03,ramp=0.5->0.8`, `lr=0.0275,ramp=0.6->0.9`, and `lr=0.0275,ramp=0.4->0.7` all regressed versus the `0.5->0.8` center, keep `0.5->0.8` as the timing center and use the remaining declared-grid probes to test whether shorter late windows or lower/higher LR interactions can improve it.
-4. If comparing against Muon, keep both Muon baselines in view: original 12-step Muon is the stronger reference, while Muon Leon-NS isolates part of the orthogonalization change. The 12-step float32 run already isolates `leon_ns_iters=12` from double precision; the next clean attribution run would isolate `eps` by trying float32, 12 steps, and `leon_eps=1e-9`.
-5. For algorithm attribution, the Leon L=0 control plus the L-scale sweep are the strongest evidence so far: L=0 reproduces Muon Leon-NS nearly exactly, and increasing `L` scale monotonically slows the 500-step trajectory.
-6. If continuing algorithm work on nonzero `L`, do not use full `L` unchanged. Test mechanisms that keep `tr(L)` from dominating normalization, such as much smaller scale, lower `beta2`, delayed activation, clipping/normalizing `tr(L)`, or computing Gram statistics from the same Nesterov update being orthogonalized.
-7. The next algorithm comparison should use the current unnormalized exponential-sum codepath rather than the abandoned bias-correction branch.
-8. Since `l_scale=1.0` is now close to the old `L=0` control, rerun the `l_scale` sweep on the current codepath if you want to know whether nonzero `L` is still helpful, neutral, or slightly harmful after the scaling fix.
-9. Before making benchmark claims, run independent trials for the new 3375-step Leon benchmark config and report mean/std plus threshold behavior, per `AGENTS.md`. The single fixed-budget head-to-head against `train_gpt_simple.py` is promising but not yet statistically sufficient.
+3. The LR sensitivity sweep (2026-05-06) **did not confirm** the hypothesis that Leon is less LR-sensitive than Muon. Muon proved at least as robust: broader plateau, better at 2× deviation, and moderately better at 4× deviation. Leon is notably fragile on the high-LR side (4× above: +0.050 vs Muon's +0.022). The true Muon optimum appears to be near lr=0.040–0.050 rather than 0.025.
+4. The schedule has now improved over tuned Leon-family baselines but not original Muon. Since `lr=0.03,ramp=0.5->0.8`, `lr=0.0275,ramp=0.6->0.9`, and `lr=0.0275,ramp=0.4->0.7` all regressed versus the `0.5->0.8` center, keep `0.5->0.8` as the timing center and use the remaining declared-grid probes to test whether shorter late windows or lower/higher LR interactions can improve it.
+5. If comparing against Muon, keep both Muon baselines in view: original 12-step Muon is the stronger reference, while Muon Leon-NS isolates part of the orthogonalization change. The 12-step float32 run already isolates `leon_ns_iters=12` from double precision; the next clean attribution run would isolate `eps` by trying float32, 12 steps, and `leon_eps=1e-9`.
+6. For algorithm attribution, the Leon L=0 control plus the L-scale sweep are the strongest evidence so far: L=0 reproduces Muon Leon-NS nearly exactly, and increasing `L` scale monotonically slows the 500-step trajectory.
+7. If continuing algorithm work on nonzero `L`, do not use full `L` unchanged. Test mechanisms that keep `tr(L)` from dominating normalization, such as much smaller scale, lower `beta2`, delayed activation, clipping/normalizing `tr(L)`, or computing Gram statistics from the same Nesterov update being orthogonalized.
+8. The next algorithm comparison should use the current unnormalized exponential-sum codepath rather than the abandoned bias-correction branch.
+9. Since `l_scale=1.0` is now close to the old `L=0` control, rerun the `l_scale` sweep on the current codepath if you want to know whether nonzero `L` is still helpful, neutral, or slightly harmful after the scaling fix.
+10. Before making benchmark claims, run independent trials for the new 3375-step Leon benchmark config and report mean/std plus threshold behavior, per `AGENTS.md`. The single fixed-budget head-to-head against `train_gpt_simple.py` is promising but not yet statistically sufficient.
 
 ## Important Commits
 

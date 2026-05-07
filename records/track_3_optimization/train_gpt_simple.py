@@ -9,9 +9,49 @@ import os
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
+import argparse
+import ast
+import json
 import uuid
 import time
 from pathlib import Path
+
+# --------------- CLI argument parsing ---------------
+def _parse_value(s):
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError):
+        return s
+
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+_parser.add_argument("--out-dir", type=str, default=None)
+_parser.add_argument("--dry-run", action="store_true")
+_parser.add_argument("legacy_trials", nargs="?", type=int)
+_cli = _parser.parse_args()
+
+_overrides = {}
+for _item in _cli.set:
+    _k, _v = _item.split("=", 1)
+    _overrides[_k] = _parse_value(_v)
+
+_BASE_HPARAMS = {"lr": 0.025, "train_steps": 3375}
+_muon_lr     = float(_overrides.get("lr", _BASE_HPARAMS["lr"]))
+_train_steps = int(_overrides.get("train_steps", _BASE_HPARAMS["train_steps"]))
+_num_trials  = _cli.legacy_trials or 1
+_run_out_dir = Path(_cli.out_dir) if _cli.out_dir else None
+
+if _cli.dry_run:
+    _config = {"lr": _muon_lr, "train_steps": _train_steps}
+    _diff   = {k: v for k, v in _config.items() if _BASE_HPARAMS.get(k) != v}
+    if _run_out_dir:
+        _run_out_dir.mkdir(parents=True, exist_ok=False)
+        (_run_out_dir / "config.json").write_text(json.dumps(_config, indent=2, sort_keys=True) + "\n")
+        (_run_out_dir / "config_diff.json").write_text(json.dumps(_diff, indent=2, sort_keys=True) + "\n")
+        print(f"dry_run:true out_dir:{_run_out_dir}")
+    print(json.dumps({"config": _config, "config_diff": _diff}, indent=2))
+    sys.exit(0)
+# ----------------------------------------------------
 
 import torch
 from torch import Tensor, nn
@@ -227,8 +267,16 @@ assert 8 % dist.get_world_size() == 0
 
 # logging setup
 if dist.get_rank() == 0:
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{uuid.uuid4()}.txt"
+    if _run_out_dir:
+        _run_out_dir.mkdir(parents=True, exist_ok=False)
+        logfile = str(_run_out_dir / "train.log")
+        _config = {"lr": _muon_lr, "train_steps": _train_steps}
+        _diff   = {k: v for k, v in _config.items() if _BASE_HPARAMS.get(k) != v}
+        (_run_out_dir / "config.json").write_text(json.dumps(_config, indent=2, sort_keys=True) + "\n")
+        (_run_out_dir / "config_diff.json").write_text(json.dumps(_diff, indent=2, sort_keys=True) + "\n")
+    else:
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{uuid.uuid4()}.txt"
     print(logfile)
 def print0(s, console=False, log=True):
     if dist.get_rank() == 0:
@@ -254,7 +302,7 @@ model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
 
 
-num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
+num_trials = _num_trials
 
 for _ in range(num_trials):
 
@@ -264,7 +312,7 @@ for _ in range(num_trials):
     ########################################
 
     # we want to minimize this while still reaching 3.28 val loss
-    train_steps = 3375
+    train_steps = _train_steps
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -289,7 +337,7 @@ for _ in range(num_trials):
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                        betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.025)
+                      lr=_muon_lr, weight_decay=0.025)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
