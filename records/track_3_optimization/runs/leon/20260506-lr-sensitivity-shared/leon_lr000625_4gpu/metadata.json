@@ -1,0 +1,42 @@
+{
+  "argv": [
+    "records/track_3_optimization/train_gpt_simple_leon.py",
+    "--trials",
+    "1",
+    "--out-dir",
+    "records/track_3_optimization/runs/leon/20260506-lr-sensitivity-shared/leon_lr000625_4gpu",
+    "--set",
+    "leon_lr=0.00625",
+    "--set",
+    "train_steps=3375",
+    "--set",
+    "leon_wd=0.025",
+    "--set",
+    "leon_cooldown_frac=0.7",
+    "--set",
+    "adam_cooldown_frac=0.7",
+    "--set",
+    "leon_beta2=0.6",
+    "--set",
+    "leon_ns_iters=12",
+    "--set",
+    "leon_eps=1e-12",
+    "--set",
+    "leon_orthogonalize_dtype=float32"
+  ],
+  "cuda_version": "12.6",
+  "cwd": "/mnt/nas/rj23424/modded-nanogpt",
+  "device_name": "NVIDIA H100 NVL",
+  "dry_run": false,
+  "git_commit": "94a9438c1a62e6e816f275b6e17fc820ad6690e6",
+  "mode": "train",
+  "out_dir": "records/track_3_optimization/runs/leon/20260506-lr-sensitivity-shared/leon_lr000625_4gpu",
+  "script": "records/track_3_optimization/train_gpt_simple_leon.py",
+  "shard_counts": {
+    "train_shards": 40,
+    "val_shards": 1
+  },
+  "torch_version": "2.11.0+cu126",
+  "trials": 1,
+  "world_size": 4
+}

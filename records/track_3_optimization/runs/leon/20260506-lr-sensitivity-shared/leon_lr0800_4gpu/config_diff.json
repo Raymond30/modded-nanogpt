@@ -1,0 +1,7 @@
+{
+  "leon_beta2": 0.6,
+  "leon_eps": 1e-12,
+  "leon_lr": 0.8,
+  "leon_ns_iters": 12,
+  "leon_orthogonalize_dtype": "float32"
+}
