@@ -1,6 +1,6 @@
 # Track 3 Optimization Experiment Handoff
 
-Last updated: 2026-05-07 America/Chicago
+Last updated: 2026-05-08 America/Chicago
 
 This stable handoff file summarizes the experiments from the recent Codex tuning conversation. The authoritative run ledger remains `records/track_3_optimization/tuning_log.csv`; use this file as a fast orientation layer before selecting the next run, and update it in place after meaningful new results.
 
@@ -281,6 +281,59 @@ The shared-grid sweep strengthens the earlier conclusion. With identical wd and 
 9. The next algorithm comparison should use the current unnormalized exponential-sum codepath rather than the abandoned bias-correction branch.
 10. Since `l_scale=1.0` is now close to the old `L=0` control, rerun the `l_scale` sweep on the current codepath if you want to know whether nonzero `L` is still helpful, neutral, or slightly harmful after the scaling fix.
 11. Before making benchmark claims, run independent trials for the new 3375-step Leon benchmark config and report mean/std plus threshold behavior, per `AGENTS.md`. The single fixed-budget head-to-head against `train_gpt_simple.py` is promising but not yet statistically sufficient.
+
+## MuonH vs AdamH Phase 2 Gauging Runs (2026-05-08)
+
+### Goal
+
+Assess whether MuonH or AdamH can reach `val_loss < 2.92` and gauge step requirements. Scripts created:
+- `records/track_3_optimization/train_gpt_simple_muonh.py` (with `--set`/`--out-dir`/`--dry-run`/`--trials`)
+- `records/track_3_optimization/train_gpt_simple_adamh.py` (same CLI)
+- `records/track_3_optimization/launch_muonh.sh` and `launch_adamh.sh`
+
+### Critical Data Budget Discovery
+
+Each FineWeb10B shard has **100M tokens = 190 steps** at batch_size=524,288. With 40 shards available at run time, the safe budget was only **7,600 steps** (not the ~18,840 originally estimated). The MuonH run was launched with `train_steps=12000` and crashed at step 7500 with `StopIteration` (data exhaustion). The AdamH run was corrected to `train_steps=7500`.
+
+**Data fix in progress**: downloading remaining shards 41–103 via `data/cached_fineweb10B.py 103`. When complete, data budget extends to **103 × 190 = 19,570 steps**.
+
+### Gauging Results (default hparams, lr=0.018)
+
+| Optimizer | train_steps | final val_loss | step_to_3.28 | reached 2.92 | Notes |
+|-----------|-------------|----------------|--------------|--------------|-------|
+| MuonH     | 7500 (crash)| 3.34592        | —            | No           | Crashed at step 7500 due to data exhaustion; set to 12000 but limited to 7600 budget; cooldown_frac=1.0 decays LR from step 0 |
+| AdamH     | 7500        | **3.21548**    | **6500**     | No           | Loss still **decreasing** at step 7500; warmup 250 steps then linear decay |
+
+### Key Findings
+
+1. **AdamH significantly outperforms MuonH at matched step budget**: at step 7500, AdamH=3.215 vs MuonH=3.346 — a gap of **0.131**. This is reversed from the original 3325-step benchmark where both reached ~3.275.
+2. **MuonH's cooldown_frac=1.0 schedule is ill-suited to extended runs**: LR decays linearly from step 0, so at step 7500 with a 12000-step budget the LR is still 0.44×peak — the model never converges tightly. The original 3325-step design was specifically tuned for this schedule length.
+3. **AdamH has a favorable warmup+decay schedule**: 250-step linear warmup then linear decay to 0. This provides a stable high-LR phase that aids convergence over the 7500-step run. AdamH crossed `val_loss < 3.28` at step 6500; loss was still decreasing at step 7500 (3.215), suggesting further potential.
+4. **Neither optimizer reached 2.92 at 7500 steps with default LR**: more steps are needed. With the full 103-shard budget (~19,570 steps), 2.92 may be reachable, especially for AdamH.
+5. **AdamH converged faster per step after warmup**: MuonH led for the first ~2500 steps (no warmup penalty), then AdamH overtook and continued pulling ahead at ~0.045 better by step 4250.
+
+### Gap trajectory (AdamH lead over MuonH at same step)
+
+| Step | MuonH | AdamH | AdamH lead |
+|------|-------|-------|------------|
+| 1250 | 3.692 | 3.751 | −0.059 (MuonH ahead) |
+| 1750 | 3.629 | 3.669 | −0.040 |
+| 2250 | 3.592 | 3.607 | −0.015 |
+| 2750 | 3.561 | 3.556 | **+0.005** (crossover) |
+| 3500 | 3.517 | 3.497 | +0.020 |
+| 4250 | 3.494 | 3.449 | +0.045 |
+| 7500 | 3.346 | 3.215 | **+0.131** |
+
+### Next Recommended Steps (Phase 3)
+
+With extended data budget now downloading:
+
+1. **Fix MuonH schedule for extended runs**: add a warmup and stable phase. Proposed: `--set warmup_steps=500 --set cooldown_frac=0.3` so the schedule is flat LR for most of training then decays at the end. This will likely bring MuonH performance closer to AdamH.
+2. **Run LR sweep for both optimizers at 7500 steps** (within confirmed safe budget): grid `{0.009, 0.013, 0.018, 0.026, 0.036}` for each. Use final val_loss as the primary metric (neither optimizer reached 2.92 at default LR in 7500 steps).
+3. **After LR sweep, consider extended runs** at best LR with the full 19,570-step budget (once shards 41–103 are available). Target `val_loss < 2.92`.
+4. **The Phase 3 question has already shifted**: the gauging data suggests AdamH may have a structural advantage over MuonH at these longer step counts with default schedules. MuonH needs schedule tuning (warmup + stable phase) to compete. The LR sweep should clarify whether this gap persists across LRs.
+
+**Immediate action**: confirm with user whether Phase 3 should add a warmup+stable phase to MuonH (to make the comparison fair) or sweep LR as-is with the default schedules.
 
 ## Important Commits
 
