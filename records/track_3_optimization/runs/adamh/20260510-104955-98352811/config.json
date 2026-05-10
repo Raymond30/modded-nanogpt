@@ -1,0 +1,5 @@
+{
+  "h_warmup_steps": 250,
+  "matrix_lr": 0.025,
+  "train_steps": 10000
+}
