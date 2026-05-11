@@ -1,0 +1,26 @@
+{
+  "argv": [
+    "records/track_3_optimization/train_gpt_simple_adamh.py",
+    "--trials",
+    "1",
+    "--set",
+    "train_steps=10000",
+    "--set",
+    "matrix_lr=0.013"
+  ],
+  "cuda_version": "12.6",
+  "cwd": "/mnt/nas/rj23424/modded-nanogpt",
+  "device_name": "NVIDIA H100 NVL",
+  "dry_run": false,
+  "git_commit": "64884bfee5da8e39bd6f02b703f1a84e04107e93",
+  "mode": "train",
+  "out_dir": "records/track_3_optimization/runs/adamh/20260510-175854-cc67da85",
+  "script": "records/track_3_optimization/train_gpt_simple_adamh.py",
+  "shard_counts": {
+    "train_shards": 103,
+    "val_shards": 1
+  },
+  "torch_version": "2.11.0+cu126",
+  "trials": 1,
+  "world_size": 4
+}
