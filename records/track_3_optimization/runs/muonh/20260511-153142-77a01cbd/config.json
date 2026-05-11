@@ -1,0 +1,5 @@
+{
+  "matrix_lr": 0.022,
+  "mu": 0.95,
+  "train_steps": 8000
+}
