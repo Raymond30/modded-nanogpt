@@ -1,0 +1,4 @@
+{
+  "h_warmup_steps": 0,
+  "train_steps": 10000
+}
