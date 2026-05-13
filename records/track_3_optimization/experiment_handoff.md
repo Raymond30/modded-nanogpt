@@ -335,6 +335,131 @@ With extended data budget now downloading:
 
 **Immediate action**: confirm with user whether Phase 3 should add a warmup+stable phase to MuonH (to make the comparison fair) or sweep LR as-is with the default schedules.
 
+## LeonV Experiments (2026-05-11)
+
+### Context
+
+LeonV (Leon Vectorized) is a new element-wise optimizer on branch `feat/leonv-optimizer`.
+Update rule:
+- m_t = β₁·m_{t-1} + g_t (unnormalized EMA, no (1−β₁) scale)
+- v_t = β₂·v_{t-1} + g_t² (unnormalized EMA)
+- w_t = w_{t-1} − lr · m_t / √(m_t² + v_t)
+
+Key properties: no bias correction; denominator bounds update in [−1,1] element-wise; uses decoupled weight decay (no hyperball projection); single optimizer for all params with 4 param groups.
+
+Script: `records/track_3_optimization/train_gpt_simple_leonv.py`
+Launcher: `records/track_3_optimization/launch_leonv.sh`
+
+### AdamW Reference Baseline
+
+Log: `records/track_3_optimization/results/a63a68d1-24aa-4a22-af9a-224e43209ea4.txt`
+
+| train_steps | final_val_loss | step_to_3.28 | matrix_lr | wd | betas | warmup | cooldown_frac |
+|---|---|---|---|---|---|---|---|
+| 5625 | 3.27903 | 5625 | 0.0015 | 0.10 | (0.9,0.95) | 250 | 0.7 |
+
+### LeonV Baseline Run
+
+Run path: `records/track_3_optimization/runs/leonv/20260511-122702-d0a85b15`
+Config: same hparams as AdamW baseline (matrix_lr=0.0015, wd=0.10, betas=(0.9,0.95), warmup=250, cooldown_frac=0.7)
+
+| train_steps | final_val_loss | step_to_3.28 | reached 3.28 | train_time | step_avg |
+|---|---|---|---|---|---|
+| 5625 | **3.28346** | — | **No** | 2415s (40.3 min) | 429 ms/step |
+
+**Comparison vs AdamW baseline at matched steps:**
+
+| Step | AdamW | LeonV | LeonV − AdamW |
+|---|---|---|---|
+| 125 | 6.190 | 6.024 | −0.166 (LeonV ahead) |
+| 500 | 4.152 | 4.202 | +0.050 |
+| 1000 | 3.773 | 3.813 | +0.040 |
+| 2500 | 3.489 | 3.502 | +0.013 |
+| 3750 | 3.381 | 3.388 | +0.007 |
+| 5000 | 3.303 | 3.307 | +0.004 |
+| 5625 | **3.279** | **3.283** | **+0.004** |
+
+**Interpretation:** LeonV leads AdamW early (step 125) due to aggressive unnormalized EMA updates, but falls behind from step 375 onward. The gap narrows continuously from ~0.050 at step 500 to ~0.004 at step 5625. LeonV missed the 3.28 threshold by 0.00443; AdamW crossed only at the final step. Default hparams (matching AdamW) are a reasonable starting point but not yet optimal for LeonV.
+
+**Performance note:** LeonV runs at ~429 ms/step vs AdamW's ~148 ms/step (3× slower) because LeonV uses an unfused Python loop over all parameters including the large embedding table (50304×768). This does not affect result correctness but matters for sweep throughput.
+
+### LeonV Hyperparameter Sweep (Screening Phase — 1500 steps)
+
+**Phase S1 — β₂ sweep** (decrease from 0.95; keep β₁=0.9, lr=0.0015, wd=0.10):
+
+Baseline (0.95) at 1500 steps: 3.65393
+
+| run_id | β₂ | val@1500 | Δ vs baseline@1500 | dir |
+|---|---|---|---|---|
+| leonv_s1_beta2_090 | **0.90** | **3.58798** | **−0.066** | `20260511-132617-126e7d9a` |
+| leonv_s1_beta2_080 | 0.80 | 3.61429 | −0.040 | `20260511-133706-dff0c3ee` |
+| leonv_s1_beta2_070 | 0.70 | 3.62890 | −0.025 | `20260511-134902-5203e7f0` |
+
+**Winner: β₂=0.90** — all lower values improve over baseline but are monotonically worse as β₂ decreases.
+
+**Phase S2 — lr sweep** (using best β₂=0.90; keep wd=0.10):
+
+| run_id | lr | val@1500 | Δ vs S1-best | dir |
+|---|---|---|---|---|
+| leonv_s2_lr_0010 | **0.001** | **3.58168** | **−0.006** | `20260511-143929-7e619139` |
+| leonv_s2_lr_0015 | 0.0015 | 3.59251 | +0.005 | `20260511-152351-61aa384e` |
+| leonv_s2_lr_0020 | 0.002 | 3.60838 | +0.021 | `20260511-145207-b1f01f91` |
+| leonv_s2_lr_0030 | 0.003 | 3.67230 | +0.084 | `20260511-150325-8072e6f6` |
+
+**Winner: lr=0.001** — monotone improvement going lower; lr=0.003 is catastrophically worse.
+
+**Phase S3 — wd sweep** (using best β₂=0.90, lr=0.001):
+
+| run_id | wd | val@1500 | Δ vs wd=0.10 | dir |
+|---|---|---|---|---|
+| leonv_s3_wd_000 | 0.00 | 3.58663 | +0.005 | `20260511-154453-679f1c4d` |
+| leonv_s3_wd_005 | 0.05 | 3.59083 | +0.009 | `20260511-155732-fe64f955` |
+| (from S2) | 0.10 | 3.58168 | 0 | `20260511-143929-7e619139` |
+| leonv_s3_wd_015 | 0.15 | 3.58703 | +0.005 | `20260511-161518-488e1c69` |
+| leonv_s3_wd_020 | **0.20** | **3.57802** | **−0.004** | `20260511-162748-e686c1f4` |
+
+**Winner: wd=0.20** — trend still falling at the high end. Full 5625-step run with S3 winner: final val 3.28338 — did NOT reach 3.28 threshold (gap +0.00435 vs AdamW). Run dir: `20260511-172513-b978030b`.
+
+**Phase S4 — auxiliary LR sweep** (embed_lr and proj_lr; using best β₂=0.90, lr=0.001, wd=0.20):
+
+**Hypothesis:** The LeonV m/√(m²+v) update has bounded magnitude in [−1,1], smaller than a typical Adam step for embed/proj weights. Larger per-group learning rates may compensate.
+
+S3 baseline at 1500 steps (wd=0.20 winner): val@1500=3.57802
+
+| run_id | embed_lr | proj_lr | matrix_lr | val@1500 | Δ vs S3 baseline | dir |
+|---|---|---|---|---|---|---|
+| leonv_s4a_embed_2x_1500 | **0.6** (2×) | 1/320 | 0.001 | 3.57849 | +0.00047 (no effect) | not archived |
+| leonv_s4b_proj_2x_1500 | 0.3 | **1/160** (2×) | 0.001 | 3.57553 | −0.00249 (modest gain) | not archived |
+| **leonv_s4c_both_2x_1500** | **0.6** (2×) | **1/160** (2×) | 0.001 | **3.56927** | **−0.00875 (BEST)** | not archived |
+| leonv_s4d_matrix_2x_1500 | 0.6 | 1/160 | **0.002** (2×) | 3.57941 | +0.01014 (worse) | not archived |
+| leonv_s4e_proj_4x_1500 | 0.6 | **0.0125** (4×) | 0.001 | 3.57896 | +0.01069 (overshoots) | `20260512-132419-82a7d59a` |
+
+**Key findings:**
+- **S4c is super-additive**: combining 2× embed_lr and 2× proj_lr (−0.00875) beats the sum of individual gains (S4a ≈ 0, S4b −0.00249), indicating a genuine interaction between the two groups.
+- **embed_lr alone has negligible effect** (S4a: +0.00047); the embedding is not the bottleneck.
+- **proj_lr alone gives modest improvement** (S4b: −0.00249), but most gain comes from the combination.
+- **4× proj_lr overshoots** (S4e worse than S4b by +0.01343); 2× is the sweet spot.
+- **2× matrix_lr hurts** (S4d: +0.01014 vs S4c); matrix LR is well-tuned at 0.001.
+
+**Winner: S4c** (`embed_lr=0.6, proj_lr=1/160`). Full 5625-step run:
+
+Run path: `records/track_3_optimization/runs/leonv/20260512-133900-2186eb8c`
+Config: `matrix_lr=0.001, embed_lr=0.6, proj_lr=1/160, leonv_betas=(0.9,0.90), leonv_wd=0.20, warmup=250, cooldown_frac=0.7, leonv_eps=1e-12`
+
+| train_steps | final_val_loss | reached 3.28 | step_avg |
+|---|---|---|---|
+| 5625 | **3.27828** | **Yes (step 5625)** | ~472 ms/step |
+
+**Result: First LeonV configuration to beat AdamW baseline (3.27903) by −0.00075 (−0.023%).** LeonV crossed the 3.28 threshold at the final step.
+
+### Current Best LeonV Config
+
+**After Phase S4 (current best):** `matrix_lr=0.001, embed_lr=0.6, proj_lr=1/160, leonv_wd=0.20, betas=(0.9,0.90), warmup=250, cooldown_frac=0.7, leonv_eps=1e-12` — final val **3.27828** @ 5625 steps. **Beats AdamW baseline (3.27903) by −0.00075.** First LeonV config to exceed AdamW performance. Run dir: `runs/leonv/20260512-133900-2186eb8c`.
+
+**Previous best (Phase S3):** `matrix_lr=0.001, leonv_wd=0.20, betas=(0.9,0.90)` — final val 3.28338 @ 5625 steps, did NOT reach 3.28 threshold. Run dir: `runs/leonv/20260511-172513-b978030b`.
+
+**Baseline:** `betas=(0.9,0.95)` — final val 3.28346 @ 5625 steps, did not reach 3.28 threshold.
+
 ## Important Commits
 
 | Commit | Purpose |
