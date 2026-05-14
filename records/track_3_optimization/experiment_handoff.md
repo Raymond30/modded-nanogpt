@@ -1,6 +1,6 @@
 # Track 3 Optimization Experiment Handoff
 
-Last updated: 2026-05-08 America/Chicago
+Last updated: 2026-05-13 America/Chicago (LeonH LR sweep complete)
 
 This stable handoff file summarizes the experiments from the recent Codex tuning conversation. The authoritative run ledger remains `records/track_3_optimization/tuning_log.csv`; use this file as a fast orientation layer before selecting the next run, and update it in place after meaningful new results.
 
@@ -281,6 +281,119 @@ The shared-grid sweep strengthens the earlier conclusion. With identical wd and 
 9. The next algorithm comparison should use the current unnormalized exponential-sum codepath rather than the abandoned bias-correction branch.
 10. Since `l_scale=1.0` is now close to the old `L=0` control, rerun the `l_scale` sweep on the current codepath if you want to know whether nonzero `L` is still helpful, neutral, or slightly harmful after the scaling fix.
 11. Before making benchmark claims, run independent trials for the new 3375-step Leon benchmark config and report mean/std plus threshold behavior, per `AGENTS.md`. The single fixed-budget head-to-head against `train_gpt_simple.py` is promising but not yet statistically sufficient.
+
+## LeonH Experiments (2026-05-13)
+
+### Context
+
+`train_gpt_simple_leonh.py` and `launch_leonh.sh` created. LeonH applies the Leon optimizer's update direction (Nesterov momentum + Newton-Schulz orthogonalization with augmented Gram matrix) via a Frobenius-norm-preserving hyperball projection (`scale_invariant_update_`) instead of decoupled weight decay. Key differences from Leon:
+- No `leon_wd` parameter; hyperball preserves `||param||_F` exactly.
+- Initialization uses MuonH-style non-zero init with per-module multipliers (×1.25 / ×3.0 / ×1.5 on residual-side projections) — required because the hyperball step is proportional to `||param||_F`, so zero-init matrices would never move.
+- Output dir: `runs/leonh/`.
+- All other Leon infrastructure unchanged (orthogonalize function, diagnostics, LR schedule, architecture, dataloader, CLI).
+
+### LeonH Baseline Run (2026-05-13)
+
+**Config:** best-known Leon hparams at `train_steps=3325` (MuonH default budget)
+`leon_lr=0.035`, `leon_beta2=0.6`, `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, `leon_eps=1e-12`, `leon_cooldown_frac=0.6`, `adam_cooldown_frac=0.7`
+
+Run path: `records/track_3_optimization/runs/leonh/20260513-122755-73a2fb7d`
+
+| train_steps | final_val_loss | step_to_3.28 | reached 3.28 | train_time | step_avg |
+|---|---|---|---|---|---|
+| 3325 | **3.36434** | — | **No** | 1655s (27.6 min) | ~490 ms/step |
+
+**Trajectory (selected checkpoints):**
+
+| Step | LeonH val | Leon (best 3375) | Delta |
+|---|---|---|---|
+| 1500 | 3.82847 | ~3.44937 (best 1500 screen) | +0.379 |
+| 2500 | 3.58861 | — | — |
+| 3000 | 3.44573 | — | — |
+| 3125 | 3.40738 | — | — |
+| 3250 | 3.37471 | — | — |
+| 3325 | 3.36434 | 3.27879 (at 3375) | +0.085 |
+
+**Key findings:**
+1. **Convergence is considerably slower than Leon with the same hparams.** At 3325 steps LeonH is 0.085 behind the best Leon run at 3375 steps. The hyperball projection changes the effective step geometry — the optimal LR and cooldown schedule will differ.
+2. **Loss is still steeply declining at the final step** (−0.037 from step 3125 to 3325), suggesting the model has not converged and the schedule/LR may be suboptimal for LeonH. More steps or a later cooldown would likely help.
+3. **Did not reach the 3.28 threshold.** The trajectory looks similar in shape to early Leon runs before LR/schedule tuning.
+4. **Step time (~490 ms)** matches the float32 12-step Leon runs, confirming no performance regression from the hyperball change.
+
+**Interpretation:** The best-known Leon hparams are a reasonable starting point but are not optimal for LeonH. The convergence gap is likely explained by (a) the effective LR being too high or too low under the hyperball normalization, and/or (b) the `leon_cooldown_frac=0.6` schedule (cooldown starts at 40% of training) being too aggressive for a slower-converging optimizer.
+
+### LeonH cooldown=1.0 + LR Sweep (2026-05-13)
+
+**Config:** `cooldown_frac=1.0` (MuonH style), `train_steps=3325`, `leon_beta2=0.6`, `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, `leon_eps=1e-12`. LR swept at factor-of-2 spacing around the baseline LR of 0.035. `lr=0.14` skipped early (triggered by `lr=0.07` underperforming).
+
+| `leon_lr` | vs 0.035 | Final val | Reached 3.28 | Run path |
+|-----------|----------|-----------|--------------|----------|
+| 0.00875 | 4× below | 3.31500 | No | `runs/leonh/20260513-151340-3bd9aefc` |
+| **0.0175** | **2× below** | **3.28272** | **No (+0.003)** | `runs/leonh/20260513-135851-51737be7` |
+| 0.035 | center | 3.31590 | No | `runs/leonh/20260513-133029-1ef077fd` |
+| 0.07 | 2× above | 3.41332 | No | `runs/leonh/20260513-143950-2831d069` |
+| 0.14 | 4× above | killed | — | `runs/leonh/20260513-155405-34fce67e` |
+
+**Key findings:**
+1. **`cooldown_frac=1.0` alone improved the center point by 0.049** (3.36434 → 3.31590 at `lr=0.035`). The schedule change is critical for LeonH.
+2. **`lr=0.0175` is the clear LR optimum** in the tested range: 0.033 better than both `lr=0.035` and `lr=0.00875`, which are nearly tied (3.315). The U-curve minimum is sharp and well-centered at 0.0175.
+3. **LeonH is highly asymmetric** — `lr=0.07` (2× high) regresses by 0.131 vs `lr=0.0175`, far worse than `lr=0.00875` (4× low) which only regresses by 0.033.
+4. **Best LeonH result is 3.28272, only 0.003 above the 3.28 threshold**, with loss still declining at the final step (−0.004 from step 3250 to 3325). More steps or a slightly refined LR could push it through.
+5. **Optimal LeonH `leon_lr` (~0.0175) is half of MuonH's `matrix_lr` (0.018 default → similar scale).** This makes sense: the hyperball step magnitude is `lr × ||param||_F / ||update||_F` rather than a simple additive step.
+
+**Current best LeonH config:** `leon_lr=0.0175`, `leon_cooldown_frac=1.0`, `leon_beta2=0.6`, `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, `leon_eps=1e-12`, `train_steps=3325`. Final val **3.28272**.
+
+**Next recommended probes for LeonH:**
+1. **Fine-grained LR refinement:** `{0.013, 0.0175, 0.022}` (√2 spacing around 0.0175) — the optimum may sit between 0.0175 and 0.025.
+2. **Extended run:** try `train_steps=4000–5000` at `lr=0.0175`; the loss was still declining at step 3325 and the threshold is only 0.003 away.
+3. Use `train_steps=3325` for all LR comparisons to keep the MuonH step budget.
+
+### LeonH LR Schedule Reshaping (2026-05-13 → 2026-05-14)
+
+Two attempts to beat the baseline 3.28272 by reshaping the LR schedule (instead of changing the peak LR). Both abandoned.
+
+**Attempt 1 — Linear warmup (`leon_warmup_steps`).** Triangular schedule: ramp 0→peak over `warmup_steps`, then linear decay to 0 over the remainder. Hypothesis: the lower-LR `lr=0.00875` run was briefly ahead mid-training (~step 2500) — perhaps because in the early "cold momentum buffer" phase, lr=0.0175 over-steps. Warmup would mimic the conservative early phase.
+
+| `leon_warmup_steps` | Final val | Δ vs no-warmup baseline (3.28272) | Run path |
+|---|---|---|---|
+| **0** (baseline) | **3.28272** | 0 | `runs/leonh/20260513-135851-51737be7` |
+| 300 | 3.28602 | **+0.00330** | `runs/leonh/20260513-180510-85e4dd52` |
+
+**Outcome:** wu300 was consistently behind baseline at every checkpoint (e.g. step 2000: 3.495 vs 3.478; step 3000: 3.324 vs 3.317). Total LR area is conserved between baseline and wu300, but the early high-LR steps in baseline produce more loss reduction per unit LR than the late low-LR steps in wu300. The "cold momentum" hypothesis was incorrect. **Warmup direction abandoned.**
+
+**Attempt 2 — Non-zero floor (`leon_min_lr_frac`).** Decay 1.0 → `min_lr_frac` instead of 1.0 → 0. Hypothesis: late-training LR (~0 in baseline) is too small for LeonH; a floor lets parameters keep refining.
+
+| `leon_min_lr_frac` | Final val | Δ vs baseline | Run path |
+|---|---|---|---|
+| **0.0** (baseline) | **3.28272** | 0 | `runs/leonh/20260513-135851-51737be7` |
+| 0.05 | 3.28917 | **+0.00645** | `runs/leonh/20260513-212811-21fc7300` |
+
+**Outcome:** floor=0.05 had higher cumulative LR than baseline (tail LR ~0.000875 vs ~0.000005). Trajectory was tied with baseline through step ~1000, then steadily fell behind by 0.015 at step 3000. The model bounces around the minimum instead of settling. Opposite of the "LR too small at end" hypothesis. **Floor direction abandoned.**
+
+### LeonH `leon_mu` and `leon_beta2` Sweep (2026-05-13 → 2026-05-14)
+
+Adaptive bracket around the inherited values (`mu=0.95, beta2=0.6`) at `lr=0.0175`, `cd=1.0`, `train_steps=3325`. Only one variable changed per run.
+
+| `leon_beta2` | `leon_mu` | Final val | Δ vs 3.28272 | Run path |
+|---|---|---|---|---|
+| 0.5 | 0.95 | 3.28299 | +0.00027 (~tie) | `runs/leonh/20260513-221551-405b9f6b` |
+| **0.6** | **0.95** | **3.28272** | 0 (best) | `runs/leonh/20260513-135851-51737be7` |
+| 0.7 | 0.95 | 3.28518 | +0.00246 | `runs/leonh/20260513-224536-11e47813` |
+| 0.6 | 0.90 | 3.29676 | +0.01404 | `runs/leonh/20260513-231429-8d9aa200` |
+| 0.6 | 0.97 | 3.28837 | +0.00565 | `runs/leonh/20260513-235240-5c9301a2` |
+
+**Key findings:**
+1. **Both brackets centered on the current values.** Neither side improves; neighbors are worse. `mu=0.95, beta2=0.6` is at a local optimum.
+2. **`mu` is the more sensitive of the two.** Dropping mu to 0.90 costs +0.014 (vs +0.0057 for raising to 0.97). beta2 is shallow (0.5/0.6/0.7 all within 0.0025).
+3. **No further sweep needed for these two.** The improvement budget for LeonH is not in the optimizer's momentum coefficients.
+
+**LeonH best remains `lr=0.0175, cd=1.0, beta2=0.6, mu=0.95, ns_iters=12, ortho_dtype=float32, eps=1e-12` → 3.28272 at 3325 steps.** Still 0.003 above the 3.28 threshold and ~0.005 behind the MuonH baseline (mean of 10 runs ≈ 3.278).
+
+**Next probes that haven't been tried:**
+1. Fine-grained LR refinement at √2 spacing around 0.0175.
+2. Extended run (`train_steps≈3500–4000`) at the current best config — loss was still declining at step 3325 (−0.004 from 3250 to 3325).
+3. Sweep `leon_l_scale` or its schedule (currently constant at 1.0).
+4. Sweep `leon_ns_iters` (currently 12; lower may be sufficient and faster, higher may improve update quality).
 
 ## MuonH vs AdamH Phase 2 Gauging Runs (2026-05-08)
 
