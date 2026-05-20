@@ -921,3 +921,78 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running PyTorch 2.11.0+cu128 compiled for CUDA 12.8 on NVIDIA H100 NVL with world_size 4
+{
+  "config_diff": {
+    "leon_beta2": 0.6,
+    "leon_cooldown_frac": 1.0,
+    "leon_eps": 1e-12,
+    "leon_l_scale": 2.0,
+    "leon_lr": 0.0175,
+    "leon_ns_iters": 12,
+    "leon_orthogonalize_dtype": "float32",
+    "leon_precondition_side": "input",
+    "train_steps": 3000
+  },
+  "hparams": {
+    "adam_betas": [
+      0.8,
+      0.95
+    ],
+    "adam_cooldown_frac": 0.7,
+    "adam_eps": 1e-10,
+    "adam_wd": 0.0,
+    "embed_lr": 0.3,
+    "leon_beta2": 0.6,
+    "leon_cooldown_frac": 1.0,
+    "leon_diag_interval": 125,
+    "leon_diag_patterns": [
+      "blocks.0.attn.q.weight",
+      "blocks.6.mlp.proj.weight",
+      "blocks.11.attn.proj.weight"
+    ],
+    "leon_eps": 1e-12,
+    "leon_l_scale": 2.0,
+    "leon_l_scale_ramp_end_frac": 0.6,
+    "leon_l_scale_ramp_start_frac": 0.2,
+    "leon_l_scale_schedule": "constant",
+    "leon_log_diagnostics": false,
+    "leon_lr": 0.0175,
+    "leon_min_lr_frac": 0.0,
+    "leon_mu": 0.95,
+    "leon_ns_iters": 12,
+    "leon_orthogonalize_dtype": "float32",
+    "leon_precondition_side": "input",
+    "proj_lr": 0.003125,
+    "scalar_lr": 0.01,
+    "train_steps": 3000
+  }
+}
+====================================================================================================
+step:0/3000 val_loss:10.99410 train_time:0.000s step_avg:nanms
+step:125/3000 val_loss:4.81466 train_time:81.828s step_avg:654.62ms
+step:250/3000 val_loss:4.17616 train_time:161.779s step_avg:639.61ms
+step:375/3000 val_loss:3.98612 train_time:241.535s step_avg:638.05ms
+step:500/3000 val_loss:3.87981 train_time:321.317s step_avg:638.26ms
+step:625/3000 val_loss:3.81312 train_time:401.056s step_avg:637.91ms
+step:750/3000 val_loss:3.76997 train_time:480.599s step_avg:636.34ms
+step:875/3000 val_loss:3.72228 train_time:560.041s step_avg:635.54ms
+step:1000/3000 val_loss:3.68024 train_time:639.512s step_avg:635.76ms
+step:1125/3000 val_loss:3.65201 train_time:718.950s step_avg:635.51ms
+step:1250/3000 val_loss:3.61943 train_time:798.398s step_avg:635.59ms
+step:1375/3000 val_loss:3.59213 train_time:877.773s step_avg:635.00ms
+step:1500/3000 val_loss:3.56299 train_time:957.180s step_avg:635.26ms
+step:1625/3000 val_loss:3.53322 train_time:1036.573s step_avg:635.14ms
+step:1750/3000 val_loss:3.50644 train_time:1116.145s step_avg:636.58ms
+step:1875/3000 val_loss:3.48103 train_time:1207.045s step_avg:727.20ms
+step:2000/3000 val_loss:3.45751 train_time:1299.365s step_avg:738.56ms
+step:2125/3000 val_loss:3.43365 train_time:1409.139s step_avg:878.20ms
+step:2250/3000 val_loss:3.40947 train_time:1489.712s step_avg:644.58ms
+step:2375/3000 val_loss:3.38755 train_time:1569.268s step_avg:636.45ms
+step:2500/3000 val_loss:3.36504 train_time:1648.826s step_avg:636.46ms
+step:2625/3000 val_loss:3.34354 train_time:1728.364s step_avg:636.30ms
+step:2750/3000 val_loss:3.32404 train_time:1807.926s step_avg:636.50ms
+step:2875/3000 val_loss:3.30735 train_time:1887.525s step_avg:636.79ms
+step:3000/3000 val_loss:3.29735 train_time:1966.985s step_avg:635.68ms

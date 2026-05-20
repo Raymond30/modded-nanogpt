@@ -921,3 +921,65 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running PyTorch 2.11.0+cu126 compiled for CUDA 12.6 on NVIDIA H100 NVL with world_size 4
+{
+  "config_diff": {
+    "leon_beta2": 0.6,
+    "leon_cooldown_frac": 1.0,
+    "leon_eps": 1e-12,
+    "leon_lr": 0.0175,
+    "leon_ns_iters": 12,
+    "leon_orthogonalize_dtype": "float32",
+    "leon_precondition_side": "input",
+    "train_steps": 1500
+  },
+  "hparams": {
+    "adam_betas": [
+      0.8,
+      0.95
+    ],
+    "adam_cooldown_frac": 0.7,
+    "adam_eps": 1e-10,
+    "adam_wd": 0.0,
+    "embed_lr": 0.3,
+    "leon_beta2": 0.6,
+    "leon_cooldown_frac": 1.0,
+    "leon_diag_interval": 125,
+    "leon_diag_patterns": [
+      "blocks.0.attn.q.weight",
+      "blocks.6.mlp.proj.weight",
+      "blocks.11.attn.proj.weight"
+    ],
+    "leon_eps": 1e-12,
+    "leon_l_scale": 1.0,
+    "leon_l_scale_ramp_end_frac": 0.6,
+    "leon_l_scale_ramp_start_frac": 0.2,
+    "leon_l_scale_schedule": "constant",
+    "leon_log_diagnostics": false,
+    "leon_lr": 0.0175,
+    "leon_min_lr_frac": 0.0,
+    "leon_mu": 0.95,
+    "leon_ns_iters": 12,
+    "leon_orthogonalize_dtype": "float32",
+    "leon_precondition_side": "input",
+    "proj_lr": 0.003125,
+    "scalar_lr": 0.01,
+    "train_steps": 1500
+  }
+}
+====================================================================================================
+step:0/1500 val_loss:11.02531 train_time:0.000s step_avg:nanms
+step:125/1500 val_loss:4.81237 train_time:84.668s step_avg:677.34ms
+step:250/1500 val_loss:4.17814 train_time:167.890s step_avg:665.77ms
+step:375/1500 val_loss:3.97367 train_time:250.715s step_avg:662.60ms
+step:500/1500 val_loss:3.86159 train_time:333.629s step_avg:663.32ms
+step:625/1500 val_loss:3.77193 train_time:416.494s step_avg:662.92ms
+step:750/1500 val_loss:3.70366 train_time:499.281s step_avg:662.30ms
+step:875/1500 val_loss:3.64474 train_time:581.931s step_avg:661.20ms
+step:1000/1500 val_loss:3.58876 train_time:664.591s step_avg:661.28ms
+step:1125/1500 val_loss:3.54265 train_time:747.286s step_avg:661.56ms
+step:1250/1500 val_loss:3.49691 train_time:829.952s step_avg:661.33ms
+step:1375/1500 val_loss:3.45939 train_time:912.601s step_avg:661.19ms
+step:1500/1500 val_loss:3.43558 train_time:995.272s step_avg:661.37ms

@@ -1,6 +1,6 @@
 # Track 3 Optimization Experiment Handoff
 
-Last updated: 2026-05-13 America/Chicago (LeonH LR sweep complete)
+Last updated: 2026-05-14 America/Chicago (LeonH side=input LR refinement complete)
 
 This stable handoff file summarizes the experiments from the recent Codex tuning conversation. The authoritative run ledger remains `records/track_3_optimization/tuning_log.csv`; use this file as a fast orientation layer before selecting the next run, and update it in place after meaningful new results.
 
@@ -17,6 +17,52 @@ This stable handoff file summarizes the experiments from the recent Codex tuning
 - A historical bias-correction branch was tried briefly, but the active code has now switched away from it and instead uses unnormalized exponential-sum scaling for the Leon moments.
 - The latest bf16 12-step orthogonalization probe diverged to NaNs at validation checkpoints starting at step 125 and was terminated after step 644. Treat it as a failed attribution run, not as a comparison point against the successful float32/float64 12-step probes.
 - The first fixed-budget 3375-step rerun of the current best Leon screen finished at `3.27879` and reached `val_loss < 3.28` for the first time in the local Leon ledger, but only at the final checkpoint `step 3375`.
+
+## LeonH Preconditioning-Side Ablation (2026-05-14)
+
+New code knob in `train_gpt_simple_leonh.py`: `leon_precondition_side ∈ {auto, input, output}` (default `auto` = current min-dim behavior, fully backward-compatible). `input` forces a `(d_in, d_in)` Gram via `grad.mT @ grad` with `X @ B` on the right; `output` forces a `(d_out, d_out)` Gram via `grad @ grad.mT` with `B @ X` on the left. In the GPT-12 architecture used here, square attention matrices are unaffected; the choice only changes behavior on the 12 mlp.fc (3072×768) and 12 mlp.proj (768×3072) layers — `input` enlarges the Gram on mlp.proj, `output` enlarges it on mlp.fc.
+
+1500-step screen at the 3325-step-best hparams (`lr=0.0175, leon_beta2=0.6, leon_mu=0.95, leon_ns_iters=12, leon_orthogonalize_dtype=float32, leon_eps=1e-12, leon_cooldown_frac=1.0`), 4× H100 NVL:
+
+| Run | side | Final val | Δ vs auto | Train time |
+| --- | --- | ---: | ---: | ---: |
+| `leonh_precond_auto_1500` | auto | 3.44042 | 0 (baseline) | 731s |
+| **`leonh_precond_input_1500`** | **input** | **3.43558** | **−0.00484** | 995s |
+| `leonh_precond_output_1500` | output | 3.43705 | −0.00337 | 998s |
+
+- Both fixed-side variants improved over auto at 1500 steps, beyond typical single-run noise. `input` was best.
+- Per-step training cost ~1.36× auto (~661 ms/step vs ~486 ms/step) because the 3072×3072 NS iteration replaces the 768×768 one on six of the twelve `mlp.*` weights.
+- Mechanism hypothesis: when the auto path uses the smaller-side Gram for wide/tall MLP weights, the matrix-inverse-square-root preconditioning sees a lower-rank picture; forcing the larger-side Gram (input on mlp.proj, output on mlp.fc) adds the rank-deficient direction with `L + eps·I` Tikhonov regularization, slightly reshaping the update on those layers.
+
+### 3325-step `side=input` confirmation
+
+Full-budget rerun at the same hparams (`leon_precondition_side=input`, all else identical to the 3325-step auto best `leonh_cd10_lr0175_3325`):
+
+| Run | side | Final val | vs auto 3325 | Best val | Reached 3.28 | Train time |
+| --- | --- | ---: | ---: | ---: | --- | ---: |
+| `leonh_cd10_lr0175_3325` | auto | 3.28272 | 0 (baseline) | 3.28272 | No (0.00272 above) | 2344.7s |
+| **`leonh_precond_input_3325`** | **input** | **3.28061** | **−0.00211** | **3.28061** | **No (0.00061 above)** | 2202.7s |
+
+- The 1500-step gap (−0.00484) shrank to −0.00211 at full budget, but the improvement is still above typical single-run noise and is consistent in sign with the screen.
+- Neither variant reached `val_loss < 3.28`. The input run is now only 0.00061 above the threshold and loss was still declining at the final step (3.28447 @ 3250 → 3.28061 @ 3325), so a small extension of `train_steps` or a tiny LR/cooldown adjustment seems likely to push it below.
+
+### LR refinement at `side=input`, 3325 steps
+
+√2-spaced bracket around 0.0175 (same hparams otherwise):
+
+| Run | lr | Final val | vs lr=0.0175 |
+| --- | --- | ---: | ---: |
+| `leonh_precond_input_3325_lr0125` | 0.0125 (~/√2) | 3.28750 | +0.00689 |
+| **`leonh_precond_input_3325`** | **0.0175 (center)** | **3.28061** | **0 (best)** |
+| `leonh_precond_input_3325_lr025` | 0.025 (~×√2) | 3.28713 | +0.00652 |
+
+- Symmetric regression on both sides confirms `lr=0.0175` as the local optimum at `side=input` — the LR optimum did NOT shift between auto and input. Bracket complete (~0.007 wide).
+- Neither bracket point crossed `val_loss < 3.28`.
+
+Worth-a-shot next probes (none run yet):
+1. `train_steps=3500` or `3750` at `side=input`, `lr=0.0175`, all else fixed — cheapest path to first below-3.28 LeonH crossing, since loss was still declining at step 3325 in the input run.
+2. `side=output` at 3325 steps for symmetry. Lower priority than (1) since input was the clearer winner in the screen.
+3. Other knobs at the input center: `leon_beta2` and `leon_mu` brackets, `leon_ns_iters` sweep, `leon_l_scale` schedule.
 
 ## Current Bests
 
@@ -394,6 +440,46 @@ Adaptive bracket around the inherited values (`mu=0.95, beta2=0.6`) at `lr=0.017
 2. Extended run (`train_steps≈3500–4000`) at the current best config — loss was still declining at step 3325 (−0.004 from 3250 to 3325).
 3. Sweep `leon_l_scale` or its schedule (currently constant at 1.0).
 4. Sweep `leon_ns_iters` (currently 12; lower may be sufficient and faster, higher may improve update quality).
+
+### LeonH `leon_l_scale` Sweep (2026-05-15)
+
+Constant-schedule sweep at 2× spacing around the default `leon_l_scale=1.0`, on top of the new `side=input` baseline (3.28061). Fixed config: `lr=0.0175, cd=1.0, beta2=0.6, mu=0.95, ns_iters=12, ortho_dtype=float32, eps=1e-12, side=input, train_steps=3325`.
+
+| `leon_l_scale` | Final val | Δ vs side=input baseline (3.28061) | Reached 3.28 | Run path |
+|---|---|---|---|---|
+| 0.5 | 3.28089 | +0.00028 (~tie) | No | `runs/leonh/20260515-084539-6dddc456` |
+| 1.0 (baseline) | 3.28061 | 0 | No | (side=input baseline) |
+| **2.0** | **3.27963** | **−0.00098** | **Yes ✓** | `runs/leonh/20260515-100510-b46ddac4` |
+| 4.0 | 3.28191 | +0.00130 | No | `runs/leonh/20260515-104222-ca6ae67c` |
+
+**Key findings:**
+1. **Clean U-shape** with the optimum at `l_scale=2.0` on the 2× grid. Direction is opposite of the historical Leon (old codepath) result, where lower L was better.
+2. **`l_scale=2.0` is the new LeonH best at 3.27963 — the FIRST LeonH config to clear the 3.28 threshold.** Beats the prior side=input best by 0.00098.
+3. **`l_scale=0.5` is essentially tied with the baseline** (within run-to-run noise); halving doesn't help. Doubling does.
+4. **`l_scale=4.0` regresses** by +0.00130 vs baseline and +0.00228 vs the new optimum — confirms the U-shape and that the 2× grid is wide enough to bracket.
+
+**Updated current best LeonH config:** `lr=0.0175, cd=1.0, beta2=0.6, mu=0.95, ns_iters=12, ortho_dtype=float32, eps=1e-12, side=input, l_scale=2.0, train_steps=3325` → **3.27963** (clears 3.28 threshold by 0.00037).
+
+**Next probes worth trying:**
+1. **√2-spaced refinement around `l_scale=2.0`** (e.g. `{1.4, 2.0, 2.8}`) — may pick up another small improvement.
+2. **Extended run** at `l_scale=2.0` with `train_steps=3500–4000` — now that we cleared the threshold, see how far below 3.28 the optimizer can go.
+3. Sweep `leon_ns_iters` (currently 12) at the new `l_scale=2.0` best.
+
+### LeonH `train_steps` Shortening Probe (2026-05-15)
+
+Tested whether the new best config (`l_scale=2.0, side=input`) can clear 3.28 with fewer than 3325 steps. With `cooldown_frac=1.0` the LR schedule rescales to the new horizon, so each shorter run uses a fresh (faster-decaying) schedule — not a truncation of the 3325-step run.
+
+| `train_steps` | Final val | Δ vs 3.28 threshold | Clears 3.28 | Run path |
+|---|---|---|---|---|
+| 3000 | 3.29735 | +0.01735 | No | `runs/leonh/20260515-114014-200341e2` |
+| 3200 | 3.28550 | +0.00550 | No | `runs/leonh/20260515-121446-a06a3a90` |
+| 3300 | 3.28039 | +0.00039 | No (right at threshold) | `runs/leonh/20260515-125529-164cf72d` |
+| **3325** | **3.27963** | **−0.00037** | **Yes ✓** | `runs/leonh/20260515-100510-b46ddac4` |
+
+**Key findings:**
+1. **The 3.28 crossing happens in a narrow 25-step window** between 3300 and 3325. `train_steps=3325` is effectively the minimum that clears the threshold for this config.
+2. **No meaningful budget to shorten.** The config sits right at the edge — 3300 misses by only 0.00039 (within single-run noise ~0.005, so a different seed could flip it), but anything materially shorter (3200, 3000) misses by a wide margin.
+3. To clear 3.28 at shorter horizons, the config itself would need to improve (e.g. the next-probe ideas from the `l_scale` section), not just trade steps.
 
 ## MuonH vs AdamH Phase 2 Gauging Runs (2026-05-08)
 
