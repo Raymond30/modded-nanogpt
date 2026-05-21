@@ -54,6 +54,16 @@ BASE_HPARAMS = dict(
     leon_l_scale_schedule = "constant",
     leon_l_scale_ramp_start_frac = 0.2,
     leon_l_scale_ramp_end_frac = 0.6,
+    # Optional: route embed / lm_head through LeonH (Leon update direction).
+    # *_hyperball=False (default) → plain p -= lr*update step.
+    # *_hyperball=True  → Frobenius-norm-preserving hyperball step (same as blocks).
+    # None LR inherits leon_lr.
+    leonh_embed             = False,
+    leonh_proj              = False,
+    leon_embed_lr           = None,
+    leon_proj_lr            = None,
+    leonh_embed_hyperball   = False,
+    leonh_proj_hyperball    = False,
     leon_log_diagnostics = False,
     leon_diag_interval  = 125,
     leon_diag_patterns  = (
@@ -505,13 +515,19 @@ class LeonH(torch.optim.Optimizer):
     """
     def __init__(self, params, lr=0.025, mu=0.95, beta2=0.7,
                  ns_iters=6, eps=1e-7, l_scale=1.0, orthogonalize_dtype="bfloat16",
-                 precondition_side="auto"):
-        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
-        params = sorted(params, key=lambda x: x.size(), reverse=True)
+                 precondition_side="auto", hyperball=True):
+        assert isinstance(params, list) and len(params) >= 1
+        if isinstance(params[0], torch.nn.Parameter):
+            params = sorted(params, key=lambda x: x.size(), reverse=True)
+        else:
+            # list of param-group dicts; sort each group's params for stable rank-sharding
+            for group in params:
+                group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
         defaults = dict(lr=lr, mu=mu, beta2=beta2,
                         ns_iters=ns_iters, eps=eps, l_scale=l_scale,
                         orthogonalize_dtype=orthogonalize_dtype,
-                        precondition_side=precondition_side)
+                        precondition_side=precondition_side,
+                        hyperball=hyperball)
         super().__init__(params, defaults)
         self.param_names = {}
 
@@ -664,7 +680,10 @@ class LeonH(torch.optim.Optimizer):
                         precondition_side=group["precondition_side"],
                     )
                     update *= max(1, p.size(-2) / p.size(-1))**0.5
-                    scale_invariant_update_(p, update, group["lr"])
+                    if group["hyperball"]:
+                        scale_invariant_update_(p, update, group["lr"])
+                    else:
+                        p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
 
@@ -773,9 +792,14 @@ def main():
                     w.mul_(1.5)
 
             # create the optimizer(s)
-            optimizer1 = AdamW([dict(params=[model.embed.weight], lr=hparams["embed_lr"]),
-                                dict(params=[model.proj.weight], lr=hparams["proj_lr"]),
-                                dict(params=[p for p in model.parameters() if p.ndim < 2], lr=hparams["scalar_lr"])],
+            adam_groups = []
+            if not hparams["leonh_embed"]:
+                adam_groups.append(dict(params=[model.embed.weight], lr=hparams["embed_lr"]))
+            if not hparams["leonh_proj"]:
+                adam_groups.append(dict(params=[model.proj.weight], lr=hparams["proj_lr"]))
+            adam_groups.append(dict(params=[p for p in model.parameters() if p.ndim < 2],
+                                    lr=hparams["scalar_lr"]))
+            optimizer1 = AdamW(adam_groups,
                                betas=hparams["adam_betas"], eps=hparams["adam_eps"],
                                weight_decay=hparams["adam_wd"], fused=True)
             optimizer2 = LeonH([p for p in model.blocks.parameters() if p.ndim >= 2],
@@ -785,6 +809,22 @@ def main():
                                l_scale=hparams["leon_l_scale"],
                                orthogonalize_dtype=hparams["leon_orthogonalize_dtype"],
                                precondition_side=hparams["leon_precondition_side"])
+            embed_lr_leon = hparams["leon_embed_lr"] if hparams["leon_embed_lr"] is not None else hparams["leon_lr"]
+            proj_lr_leon = hparams["leon_proj_lr"] if hparams["leon_proj_lr"] is not None else hparams["leon_lr"]
+            # embed.weight and proj.weight both have shape (vocab=50304, model_dim=768).
+            # Force precondition_side="input" so the Newton-Schulz Gram is on the small
+            # model_dim side (768x768), regardless of what leon_precondition_side is set
+            # to for the block group.
+            if hparams["leonh_embed"]:
+                optimizer2.add_param_group(dict(params=[model.embed.weight],
+                                                lr=embed_lr_leon,
+                                                hyperball=bool(hparams["leonh_embed_hyperball"]),
+                                                precondition_side="input"))
+            if hparams["leonh_proj"]:
+                optimizer2.add_param_group(dict(params=[model.proj.weight],
+                                                lr=proj_lr_leon,
+                                                hyperball=bool(hparams["leonh_proj_hyperball"]),
+                                                precondition_side="input"))
             optimizer2.param_names = {p: name for name, p in model.named_parameters()}
             optimizers = [optimizer1, optimizer2]
             assert set(p for opt in optimizers for group in opt.param_groups
