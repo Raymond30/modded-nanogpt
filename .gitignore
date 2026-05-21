@@ -6,3 +6,4 @@ logs/
 data/
 .venv
 settings.json
+wandb/

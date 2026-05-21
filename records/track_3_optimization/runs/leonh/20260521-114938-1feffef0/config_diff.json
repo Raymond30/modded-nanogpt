@@ -1,0 +1,4 @@
+{
+  "train_steps": 125,
+  "wandb_project": "modded-nanogpt-track3"
+}
