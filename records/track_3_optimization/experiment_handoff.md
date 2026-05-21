@@ -1,6 +1,6 @@
 # Track 3 Optimization Experiment Handoff
 
-Last updated: 2026-05-14 America/Chicago (LeonH side=input LR refinement complete)
+Last updated: 2026-05-21 America/Chicago (LeonH proj-via-hyperball 3-point sweep complete; HB optimum at lr=0.0175 → 3.45400, best variant overall but still +0.020 worse than AdamW baseline)
 
 This stable handoff file summarizes the experiments from the recent Codex tuning conversation. The authoritative run ledger remains `records/track_3_optimization/tuning_log.csv`; use this file as a fast orientation layer before selecting the next run, and update it in place after meaningful new results.
 
@@ -480,6 +480,78 @@ Tested whether the new best config (`l_scale=2.0, side=input`) can clear 3.28 wi
 1. **The 3.28 crossing happens in a narrow 25-step window** between 3300 and 3325. `train_steps=3325` is effectively the minimum that clears the threshold for this config.
 2. **No meaningful budget to shorten.** The config sits right at the edge — 3300 misses by only 0.00039 (within single-run noise ~0.005, so a different seed could flip it), but anything materially shorter (3200, 3000) misses by a wide margin.
 3. To clear 3.28 at shorter horizons, the config itself would need to improve (e.g. the next-probe ideas from the `l_scale` section), not just trade steps.
+
+### LeonH embed/lm_head migration probe (2026-05-20)
+
+**Code change:** `train_gpt_simple_leonh.py` now supports routing `model.embed.weight` and/or `model.proj.weight` through LeonH (Leon's Nesterov + Newton-Schulz orthogonalized direction) **without the hyperball projection** — a plain `p -= lr * update` step — via four new hparams: `leonh_embed`, `leonh_proj`, `leon_embed_lr` (default `None` → inherits `leon_lr`), `leon_proj_lr` (same). The block (hidden 2D matrix) group still uses the hyperball update. The new groups pin `precondition_side="input"` so the NS Gram is on the model_dim (768×768) side for both layers (their weight shape is `(50304, 768)`).
+
+**Phase 1 screen — 1500 steps, 4× H100 NVL, all other hparams at the current best LeonH center** (`lr=0.0175, cd=1.0, beta2=0.6, mu=0.95, ns_iters=12, ortho_dtype=float32, eps=1e-12, side=input, l_scale=2.0`).
+
+| Run | Config | Final val_loss @ 1500 | Δ vs baseline | Train time |
+| --- | --- | ---: | ---: | ---: |
+| `leonh_input_lscale20_1500` | baseline (AdamW for embed/proj) | **3.43365** | 0 | 957.7s |
+| `leonh_input_lscale20_1500_embedh` | `leonh_embed=True`, lr=0.0175 | 3.51561 | +0.08196 | 1002.6s |
+| `leonh_input_lscale20_1500_projh` | `leonh_proj=True`, lr=0.0175 | 3.46159 | +0.02794 | 1015.7s |
+| `leonh_input_lscale20_1500_projh_lr00875` | `leonh_proj=True`, `leon_proj_lr=0.00875` (lr/2) | 3.47378 | +0.04013 | 1019.8s |
+| `leonh_input_lscale20_1500_projh_lr035` | `leonh_proj=True`, `leon_proj_lr=0.035` (lr×2) | **3.45929** | **+0.02564** (best variant) | 1017.8s |
+| `leonh_input_lscale20_1500_projh_lr07` | `leonh_proj=True`, `leon_proj_lr=0.07` (lr×4) | 3.46719 | +0.03354 | 1017.2s |
+| `leonh_input_lscale20_1500_projh_hyper_lr00875` | `leonh_proj=True`, `leonh_proj_hyperball=True`, `lr=0.00875` | 3.46567 | +0.03202 | 1110.9s |
+| `leonh_input_lscale20_1500_projh_hyper_lr0175` | `leonh_proj=True`, `leonh_proj_hyperball=True`, `lr=0.0175` | **3.45400** | **+0.02035** (best variant) | 1022.3s |
+| `leonh_input_lscale20_1500_projh_hyper_lr035` | `leonh_proj=True`, `leonh_proj_hyperball=True`, `lr=0.035` | 3.46913 | +0.03548 | 1058.6s |
+
+**Trajectory (selected checkpoints):**
+
+| Step | Baseline | Embed lr=0.0175 | Proj lr=0.0175 | Proj lr=0.00875 | Proj lr=0.035 | Proj lr=0.07 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 125  | 4.78504 | 5.05934 | 4.96788 | 5.23668 | 4.99599 | 5.00515 |
+| 500  | 3.85036 | 3.99176 | 3.90013 | 3.92790 | 3.90603 | 3.94104 |
+| 1000 | 3.58660 | 3.68955 | 3.61819 | 3.63170 | 3.61921 | 3.62913 |
+| 1500 | 3.43365 | 3.51561 | 3.46159 | 3.47378 | 3.45929 | 3.46719 |
+
+**proj_lr 4-point sweep (no-hyperball):**
+
+| `leon_proj_lr` | Final val_loss @ 1500 | Δ vs baseline | Δ vs no-HB lr=0.035 |
+|---:|---:|---:|---:|
+| 0.00875 (lr/2)  | 3.47378 | +0.04013 | +0.01449 |
+| 0.0175 (default)| 3.46159 | +0.02794 | +0.00230 |
+| **0.035 (best no-HB)** | **3.45929** | **+0.02564** | 0 |
+| 0.07 (lr×4)     | 3.46719 | +0.03354 | +0.00790 |
+
+Clean U-shape with optimum at `leon_proj_lr=0.035` on the 4-point grid. Bracket is closed.
+
+**proj_lr 3-point sweep (HYPERBALL):** added `leonh_proj_hyperball` hparam (default `False`); when `True`, the proj group uses the same Frobenius-norm-preserving step as the block group instead of plain `p -= lr*update`.
+
+| `leon_proj_lr` | Final val_loss @ 1500 | Δ vs baseline | Δ vs HB lr=0.0175 |
+|---:|---:|---:|---:|
+| 0.00875 (lr/2) | 3.46567 | +0.03202 | +0.01167 |
+| **0.0175 (best HB)** | **3.45400** | **+0.02035** | 0 |
+| 0.035 (lr×2) | 3.46913 | +0.03548 | +0.01513 |
+
+Clean U-shape, optimum at `leon_proj_lr=0.0175`. The HB LR optimum is at HALF the no-HB LR optimum (0.0175 vs 0.035), because hyperball's effective relative step is `lr × cos(angle)` ≈ `lr`, while no-hyperball's effective step is `lr × ||update||_F/||p||_F ≈ lr × 1.74` (using init ||p||_F ≈ 128.6 and ||update||_F ≈ 224). So the matched-relative-step pair would be HB lr ≈ 0.0203 vs no-HB lr ≈ 0.035 — broadly consistent with what we observe.
+
+**HB beats no-HB at the same LR by −0.00759** (HB lr=0.0175: 3.45400 vs no-HB lr=0.0175: 3.46159) and **HB-best beats no-HB-best by −0.00529** (3.45400 vs 3.45929).
+
+**Interpretation:**
+
+1. **No variant beats baseline.** All 8 LeonH-on-embed/proj configurations regress vs AdamW. The smallest regression is +0.02035 (proj-only HB, lr=0.0175) — still ~4× the 1500-step single-run noise (~0.005).
+2. **Embed-via-LeonH is much worse than proj-via-LeonH** (+0.082 vs +0.020). Probable cause: the embed receives a sparse-row gradient (only tokens actually present in the batch get signal), and orthogonalising this matrix propagates noise into the untouched rows, moving the entire embedding table every step. The lm_head's gradient is dense (every vocab row gets signal via softmax), so orthogonalisation is structurally less harmful.
+3. **Hyperball helps proj.** At equal LR=0.0175, HB beats no-HB by −0.00759. The HB U-shape optimum (lr=0.0175 → 3.45400) beats the no-HB U-shape optimum (lr=0.035 → 3.45929) by −0.00529. So the Frobenius-norm-preserving step is the correct update geometry for the lm_head, just as it is for hidden weights.
+4. **Both U-shapes are closed.** No-HB optimum at lr=0.035 with brackets at 0.00875/0.07; HB optimum at lr=0.0175 with brackets at 0.00875/0.035. Further LR refinement won't close the remaining +0.020 gap.
+5. **The +0.020 proj-only gap is fundamental at this scale.** Cannot be closed by LR or hyperball-toggle alone; would require structural changes (different schedule, weight decay, init, larger/different model dim, or a fundamentally different update for the lm_head).
+6. **Per-step cost ~+5–6%** (676–680 ms vs 638 ms) — the (768,768) NS iteration on the extra weight is cheap; speed is not the problem.
+
+**Conclusion of this probe:** Replacing AdamW with LeonH (either no-hyperball or hyperball) on the lm_head improves marginally with hyperball+matched-LR, but does not beat AdamW. The best proj-only config (HB, lr=0.0175) is +0.020 worse than the AdamW baseline at 1500 steps. Embed-via-LeonH is structurally weaker and not worth further sweeping. Direction abandoned unless paired with other structural changes.
+
+Run paths:
+- baseline: `records/track_3_optimization/runs/leonh/20260520-120437-487a6094`
+- embed-only, lr=0.0175: `records/track_3_optimization/runs/leonh/20260520-145230-4bb0826a`
+- proj-only no-HB, lr=0.0175: `records/track_3_optimization/runs/leonh/20260520-162049-d64d968e`
+- proj-only no-HB, lr=0.00875: `records/track_3_optimization/runs/leonh/20260520-164352-ec26b156`
+- proj-only no-HB, lr=0.035 (best no-HB): `records/track_3_optimization/runs/leonh/20260520-171014-eb595f71`
+- proj-only no-HB, lr=0.07: `records/track_3_optimization/runs/leonh/20260520-173900-383a1db3`
+- proj-only HB, lr=0.0175 (best variant overall): `records/track_3_optimization/runs/leonh/20260520-233623-a0221f53`
+- proj-only HB, lr=0.035: `records/track_3_optimization/runs/leonh/20260521-102246-53dfae8a`
+- proj-only HB, lr=0.00875: `records/track_3_optimization/runs/leonh/20260521-104221-bdeb9b30`
 
 ## MuonH vs AdamH Phase 2 Gauging Runs (2026-05-08)
 
