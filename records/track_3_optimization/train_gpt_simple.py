@@ -35,14 +35,20 @@ for _item in _cli.set:
     _k, _v = _item.split("=", 1)
     _overrides[_k] = _parse_value(_v)
 
-_BASE_HPARAMS = {"lr": 0.025, "train_steps": 3375}
-_muon_lr     = float(_overrides.get("lr", _BASE_HPARAMS["lr"]))
-_train_steps = int(_overrides.get("train_steps", _BASE_HPARAMS["train_steps"]))
+_BASE_HPARAMS = {"lr": 0.025, "train_steps": 3375, "wandb_project": None,
+                 "wandb_mode": "online", "wandb_run_name": None}
+_muon_lr        = float(_overrides.get("lr", _BASE_HPARAMS["lr"]))
+_train_steps    = int(_overrides.get("train_steps", _BASE_HPARAMS["train_steps"]))
+_wandb_project  = _overrides.get("wandb_project", _BASE_HPARAMS["wandb_project"])
+_wandb_mode     = _overrides.get("wandb_mode", _BASE_HPARAMS["wandb_mode"])
+_wandb_run_name = _overrides.get("wandb_run_name", _BASE_HPARAMS["wandb_run_name"])
 _num_trials  = _cli.legacy_trials or 1
 _run_out_dir = Path(_cli.out_dir) if _cli.out_dir else None
 
 if _cli.dry_run:
-    _config = {"lr": _muon_lr, "train_steps": _train_steps}
+    _config = {"lr": _muon_lr, "train_steps": _train_steps,
+               "wandb_project": _wandb_project, "wandb_mode": _wandb_mode,
+               "wandb_run_name": _wandb_run_name}
     _diff   = {k: v for k, v in _config.items() if _BASE_HPARAMS.get(k) != v}
     if _run_out_dir:
         _run_out_dir.mkdir(parents=True, exist_ok=False)
@@ -270,7 +276,9 @@ if dist.get_rank() == 0:
     if _run_out_dir:
         _run_out_dir.mkdir(parents=True, exist_ok=False)
         logfile = str(_run_out_dir / "train.log")
-        _config = {"lr": _muon_lr, "train_steps": _train_steps}
+        _config = {"lr": _muon_lr, "train_steps": _train_steps,
+                   "wandb_project": _wandb_project, "wandb_mode": _wandb_mode,
+                   "wandb_run_name": _wandb_run_name}
         _diff   = {k: v for k, v in _config.items() if _BASE_HPARAMS.get(k) != v}
         (_run_out_dir / "config.json").write_text(json.dumps(_config, indent=2, sort_keys=True) + "\n")
         (_run_out_dir / "config_diff.json").write_text(json.dumps(_diff, indent=2, sort_keys=True) + "\n")
@@ -278,6 +286,27 @@ if dist.get_rank() == 0:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{uuid.uuid4()}.txt"
     print(logfile)
+
+wandb_run = None
+if _wandb_project is not None and dist.get_rank() == 0:
+    try:
+        import wandb
+        _wandb_dir = str(_run_out_dir) if _run_out_dir else "."
+        _wandb_default_name = Path(logfile).parent.name if _run_out_dir else Path(logfile).stem
+        wandb_run = wandb.init(
+            project=_wandb_project,
+            mode=_wandb_mode,
+            name=_wandb_run_name or _wandb_default_name,
+            dir=_wandb_dir,
+            config={"lr": _muon_lr, "train_steps": _train_steps,
+                    "wandb_project": _wandb_project, "wandb_mode": _wandb_mode,
+                    "wandb_run_name": _wandb_run_name},
+            tags=[Path(__file__).stem, f"world_size={dist.get_world_size()}"],
+        )
+    except Exception as e:
+        print(f"[wandb] init failed, continuing without wandb: {e}")
+        wandb_run = None
+
 def print0(s, console=False, log=True):
     if dist.get_rank() == 0:
         if console:
@@ -390,6 +419,12 @@ for _ in range(num_trials):
             val_loss /= val_tokens
             print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
                    + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+            if wandb_run is not None:
+                wandb_run.log({
+                    "val_loss": float(val_loss),
+                    "train_time_s": training_time,
+                    "step_avg_ms": 1000 * step_avg if step > 0 else 0.0,
+                }, step=step)
             model.train()
             # start the clock again
             dist.barrier()
@@ -416,4 +451,6 @@ for _ in range(num_trials):
         print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
                + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
+if wandb_run is not None:
+    wandb_run.finish()
 dist.destroy_process_group()

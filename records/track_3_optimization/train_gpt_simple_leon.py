@@ -54,6 +54,13 @@ BASE_HPARAMS = dict(
         "blocks.6.mlp.proj.weight",
         "blocks.11.attn.proj.weight",
     ),
+    # Optional wandb logging (off by default). Enable with --set wandb_project=<name>.
+    # File artifacts (train.log, config.json, tuning_log.csv) remain authoritative.
+    wandb_project = None,
+    wandb_mode    = "online",  # "online" | "offline" | "disabled"
+    # Optional. If unset, the wandb run name falls back to run_dir.name (the timestamp+uuid).
+    # Set this to your tuning_log.csv run_id so the dashboard matches the ledger.
+    wandb_run_name = None,
 )
 
 
@@ -664,6 +671,22 @@ def main():
                 world_size=dist.get_world_size(),
             ))
 
+        wandb_run = None
+        if hparams["wandb_project"] is not None and dist.get_rank() == 0:
+            try:
+                import wandb
+                wandb_run = wandb.init(
+                    project=hparams["wandb_project"],
+                    mode=hparams.get("wandb_mode", "online"),
+                    name=hparams.get("wandb_run_name") or run_dir.name,
+                    dir=str(run_dir),
+                    config=hparams,
+                    tags=[Path(__file__).stem, f"world_size={dist.get_world_size()}"],
+                )
+            except Exception as e:
+                print(f"[wandb] init failed, continuing without wandb: {e}")
+                wandb_run = None
+
         def print0(s, console=False, log=True):
             if dist.get_rank() == 0:
                 if console:
@@ -791,6 +814,11 @@ def main():
                         + f" l_top_eval_fraction:{row['l_top_eval_fraction']:.6g}",
                         console=False,
                     )
+                if wandb_run is not None:
+                    wandb_run.log({
+                        f"diag/{row['name']}/{k}": v
+                        for row in rows for k, v in row.items() if k != "name"
+                    }, step=step)
 
 
             ########################################
@@ -825,6 +853,12 @@ def main():
                     val_loss /= val_tokens
                     print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
                            + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+                    if wandb_run is not None:
+                        wandb_run.log({
+                            "val_loss": float(val_loss),
+                            "train_time_s": training_time,
+                            "step_avg_ms": 1000 * step_avg if step > 0 else 0.0,
+                        }, step=step)
                     model.train()
                     # start the clock again
                     dist.barrier()
@@ -852,6 +886,8 @@ def main():
                 print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
                        + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
     finally:
+        if 'wandb_run' in locals() and wandb_run is not None:
+            wandb_run.finish()
         dist.destroy_process_group()
 
 

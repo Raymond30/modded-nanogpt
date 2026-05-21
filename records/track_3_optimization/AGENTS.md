@@ -14,7 +14,7 @@ Primary objective:
 
 Primary metric:
 
-- `step_to_threshold`: the first validation step at which `val_loss < 3.28`. Because validation is periodic, `step_to_threshold` means the first validation checkpoint where `val_loss < 3.28`.
+- `step_to_threshold`: the first periodic validation checkpoint where `val_loss < 3.28`.
 
 Secondary metrics:
 
@@ -172,6 +172,8 @@ For final benchmark claims:
 - After each meaningful real training result, update `records/track_3_optimization/experiment_handoff.md` with the concise result summary and next-decision context.
 - Sweep records should include script name, exact config diff from base, number of trials, GPU count/model, PyTorch/CUDA version from logs, log paths, final loss per run, mean/std final loss, and total training time.
 - Archive important completed logs under `records/track_3_optimization/results/` only when explicitly asked.
+- Optional wandb logging is opt-in via `--set wandb_project=modded-nanogpt-track3` (add `--set wandb_mode=offline` if the host has no outbound network). It mirrors `val_loss`/`train_time_s`/`step_avg_ms` and, when enabled, per-layer `diag/*` to wandb; the file artifacts above remain authoritative. If `wandb_project` is unset or `wandb.init` fails, training proceeds with file logging only.
+- Pair every wandb-enabled run with `--set wandb_run_name=<run_id>` matching the `tuning_log.csv` `run_id` you'll write. Unset → wandb falls back to the `<timestamp>-<uuid>` run-dir basename, which is harder to cross-reference later.
 
 
 ## Summarizing Sweep Results

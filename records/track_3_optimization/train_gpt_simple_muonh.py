@@ -34,6 +34,13 @@ BASE_HPARAMS = {
     "train_steps": 3325,
     "matrix_lr": 0.018,
     "mu": 0.95,
+    # Optional wandb logging (off by default). Enable with --set wandb_project=<name>.
+    # File artifacts (train.log, config.json, tuning_log.csv) remain authoritative.
+    "wandb_project": None,
+    "wandb_mode":    "online",  # "online" | "offline" | "disabled"
+    # Optional. If unset, the wandb run name falls back to run_dir.name (the timestamp+uuid).
+    # Set this to your tuning_log.csv run_id so the dashboard matches the ledger.
+    "wandb_run_name": None,
 }
 
 
@@ -385,6 +392,22 @@ if dist.get_rank() == 0:
         device_name=torch.cuda.get_device_name(device),
     ))
 
+wandb_run = None
+if hparams.get("wandb_project") is not None and dist.get_rank() == 0:
+    try:
+        import wandb
+        wandb_run = wandb.init(
+            project=hparams["wandb_project"],
+            mode=hparams.get("wandb_mode", "online"),
+            name=hparams.get("wandb_run_name") or run_dir.name,
+            dir=str(run_dir),
+            config=hparams,
+            tags=[Path(__file__).stem, f"world_size={dist.get_world_size()}"],
+        )
+    except Exception as e:
+        print(f"[wandb] init failed, continuing without wandb: {e}")
+        wandb_run = None
+
 print0(code)
 print0("="*100)
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
@@ -503,6 +526,12 @@ for _ in range(num_trials):
             val_loss /= val_tokens
             print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
                    + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+            if wandb_run is not None:
+                wandb_run.log({
+                    "val_loss": float(val_loss),
+                    "train_time_s": training_time,
+                    "step_avg_ms": 1000 * step_avg if step > 0 else 0.0,
+                }, step=step)
             model.train()
             # start the clock again
             dist.barrier()
@@ -529,4 +558,6 @@ for _ in range(num_trials):
         print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
                + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
+if wandb_run is not None:
+    wandb_run.finish()
 dist.destroy_process_group()
