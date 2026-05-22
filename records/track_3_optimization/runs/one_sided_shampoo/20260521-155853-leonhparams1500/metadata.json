@@ -1,0 +1,40 @@
+{
+  "argv": [
+    "records/track_3_optimization/train_gpt_simple_one_sided_shampoo.py",
+    "--trials",
+    "1",
+    "--out-dir",
+    "records/track_3_optimization/runs/one_sided_shampoo/20260521-155853-leonhparams1500",
+    "--set",
+    "train_steps=1500",
+    "--set",
+    "shampoo_lr=0.025",
+    "--set",
+    "shampoo_wd=0.025",
+    "--set",
+    "shampoo_beta1=0.95",
+    "--set",
+    "shampoo_beta2=0.95",
+    "--set",
+    "shampoo_cooldown_frac=0.7",
+    "--set",
+    "wandb_project=modded-nanogpt-track3",
+    "--set",
+    "wandb_run_name=oss-leonhparams-1500"
+  ],
+  "cuda_version": "12.8",
+  "cwd": "/mnt/nas/rj23424/modded-nanogpt",
+  "device_name": "NVIDIA H100 NVL",
+  "dry_run": false,
+  "git_commit": "3e8cf296789a912e1ff53032c23947288d78810a",
+  "mode": "train",
+  "out_dir": "records/track_3_optimization/runs/one_sided_shampoo/20260521-155853-leonhparams1500",
+  "script": "records/track_3_optimization/train_gpt_simple_one_sided_shampoo.py",
+  "shard_counts": {
+    "train_shards": 103,
+    "val_shards": 1
+  },
+  "torch_version": "2.11.0+cu128",
+  "trials": 1,
+  "world_size": 4
+}

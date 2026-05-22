@@ -1,0 +1,757 @@
+"""
+train_gpt_simple_one_sided_shampoo.py
+
+This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
+It was prepared as a simplified version of the speedrun for use in neural net optimization research.
+This variant replaces Muon with one-sided Shampoo, whose `L^{-1/2} M` update direction is
+computed via an `AugmentedNS(M, A) = (M Mᵀ + A)^{-1/2} M` Newton–Schulz subroutine driven by
+the residual-Gram recursion (M_t, V_t, λ_t) so that L_t = (1/λ_t) M_t M_tᵀ + V_t holds exactly
+and the update reduces to √λ_t · AugmentedNS(M_t, λ_t V_t).
+"""
+
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import argparse
+import ast
+import json
+import math
+import subprocess
+import uuid
+import time
+from datetime import datetime
+from pathlib import Path
+
+
+BASE_HPARAMS = dict(
+    # Training
+    train_steps         = 3375,
+    # AdamW — embedding
+    embed_lr            = 0.3,
+    # AdamW — lm_head projection
+    proj_lr             = 1/320,
+    # AdamW — scalars (biases, gains)
+    scalar_lr           = 0.01,
+    # AdamW shared
+    adam_betas          = (0.8, 0.95),
+    adam_eps            = 1e-10,
+    adam_wd             = 0.0,
+    adam_cooldown_frac  = 0.7,
+    # One-sided Shampoo — 2D block params
+    shampoo_lr             = 0.025,
+    shampoo_wd             = 0.025,
+    shampoo_beta1          = 0.9,   # M EMA coefficient; β₁² < β₂ keeps λ_t bounded
+    shampoo_beta2          = 0.95,  # L EMA coefficient
+    shampoo_cooldown_frac  = 0.7,
+    shampoo_ns_iters       = 6,
+    shampoo_eps            = 1e-9,
+    shampoo_orthogonalize_dtype = "bfloat16",
+    # Optional wandb logging (off by default). Enable with --set wandb_project=<name>.
+    # File artifacts (train.log, config.json, tuning_log.csv) remain authoritative.
+    wandb_project = None,
+    wandb_mode    = "online",  # "online" | "offline" | "disabled"
+    # Optional. If unset, the wandb run name falls back to run_dir.name (the timestamp+uuid).
+    # Set this to your tuning_log.csv run_id so the dashboard matches the ledger.
+    wandb_run_name = None,
+)
+
+
+def parse_value(s: str):
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError):
+        return s
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("legacy_trials", nargs="?", type=int,
+                        help="Legacy positional trial count. Prefer --trials.")
+    parser.add_argument("--trials", type=int, default=None)
+    parser.add_argument("--set", action="append", default=[],
+                        metavar="KEY=VALUE", help="Override or add an hparams entry.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Resolve config and write metadata without CUDA/NCCL/training.")
+    parser.add_argument("--out-dir", type=Path, default=None,
+                        help="Run output directory. Defaults to runs/one_sided_shampoo/<timestamp>-<uuid>.")
+    return parser.parse_args()
+
+
+def resolve_hparams(overrides):
+    hparams = dict(BASE_HPARAMS)
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"--set expects KEY=VALUE, got {item!r}")
+        key, raw_value = item.split("=", 1)
+        value = parse_value(raw_value)
+        if key == "cooldown_frac":
+            hparams["adam_cooldown_frac"] = value
+            hparams["shampoo_cooldown_frac"] = value
+        hparams[key] = value
+    return hparams
+
+
+def config_diff(hparams):
+    return {k: v for k, v in hparams.items() if BASE_HPARAMS.get(k) != v}
+
+
+def validate_hparams(hparams):
+    orthogonalize_dtype = hparams["shampoo_orthogonalize_dtype"]
+    if orthogonalize_dtype not in ("bfloat16", "float32", "float64"):
+        raise ValueError(
+            "shampoo_orthogonalize_dtype must be 'bfloat16', 'float32', or 'float64', "
+            f"got {orthogonalize_dtype!r}"
+        )
+
+    b1 = float(hparams["shampoo_beta1"])
+    b2 = float(hparams["shampoo_beta2"])
+    if not (0 <= b1 < 1):
+        raise ValueError(f"shampoo_beta1 must be in [0, 1), got {b1!r}")
+    if not (0 <= b2 < 1):
+        raise ValueError(f"shampoo_beta2 must be in [0, 1), got {b2!r}")
+    if b1 * b1 >= b2:
+        # λ_t recursion is unbounded when β₁² ≥ β₂ (spec §2.4); math is still valid.
+        print(
+            f"[warn] shampoo_beta1²={b1*b1:.6g} ≥ shampoo_beta2={b2:.6g}: "
+            "λ_t recursion is unbounded; consider clamping or lowering beta1.",
+            file=sys.stderr,
+        )
+
+
+def default_run_dir():
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path("records/track_3_optimization/runs/one_sided_shampoo") / f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def create_run_dir(out_dir=None):
+    run_dir = Path(out_dir) if out_dir is not None else default_run_dir()
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def git_commit():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return None
+
+
+def shard_counts():
+    cwd = Path.cwd()
+    return dict(
+        train_shards=len(list(cwd.glob("data/fineweb10B/fineweb_train_*.bin"))),
+        val_shards=len(list(cwd.glob("data/fineweb10B/fineweb_val_*.bin"))),
+    )
+
+
+def torch_versions():
+    torch_module = globals().get("torch")
+    if torch_module is None:
+        return None, None
+    return torch_module.version.__version__, torch_module.version.cuda
+
+
+def write_run_files(run_dir, args, hparams, mode, extra=None):
+    torch_version, cuda_version = torch_versions()
+    diff = config_diff(hparams)
+    metadata = dict(
+        mode=mode,
+        argv=sys.argv,
+        cwd=str(Path.cwd()),
+        script=sys.argv[0],
+        trials=args.trials if args.trials is not None else (args.legacy_trials or 1),
+        dry_run=args.dry_run,
+        out_dir=str(run_dir),
+        git_commit=git_commit(),
+        torch_version=torch_version,
+        cuda_version=cuda_version,
+        shard_counts=shard_counts(),
+    )
+    if extra:
+        metadata.update(extra)
+    (run_dir / "config.json").write_text(json.dumps(hparams, indent=2, sort_keys=True) + "\n")
+    (run_dir / "config_diff.json").write_text(json.dumps(diff, indent=2, sort_keys=True) + "\n")
+    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+
+
+if "--dry-run" in sys.argv:
+    args = parse_args()
+    hparams = resolve_hparams(args.set)
+    validate_hparams(hparams)
+    run_dir = create_run_dir(args.out_dir)
+    write_run_files(run_dir, args, hparams, "dry-run")
+    print(f"dry_run:true out_dir:{run_dir}")
+    print(json.dumps(dict(hparams=hparams, config_diff=config_diff(hparams)), indent=2, sort_keys=True))
+    sys.exit(0)
+
+import torch
+from torch import Tensor, nn
+from torch.optim import AdamW
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+########################################
+#              Dataloader              #
+########################################
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % dist.get_world_size() == 0
+    local_batch_size = batch_size // dist.get_world_size()
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        pos += batch_size
+        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
+
+
+########################################
+#             Architecture             #
+########################################
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        # half-truncate RoPE (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        self.register_buffer("angular_freq", torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
+
+    def forward(self, x_BTHD: Tensor):
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
+        theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
+        cos, sin = theta.cos(), theta.sin()
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim=128):
+        super().__init__()
+        self.num_heads = dim // head_dim
+        self.head_dim = head_dim
+        hdim = self.num_heads * self.head_dim
+        self.q = Linear(dim, hdim)
+        self.k = Linear(dim, hdim)
+        self.v = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+        self.rotary = Rotary(head_dim)
+
+    def forward(self, x: Tensor):
+        B, T = x.size(0), x.size(1)
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        q, k = self.rotary(q), self.rotary(k)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                           v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        y = self.proj(y)
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.fc = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+
+    def forward(self, x: Tensor):
+        x = self.fc(x)
+        x = x.relu().square()
+        x = self.proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim)
+        self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+    def forward(self, x: Tensor):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
+        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
+        self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
+
+    def forward(self, inputs: Tensor, targets: Tensor):
+        x = self.norm1(self.embed(inputs))
+        for block in self.blocks:
+            x = block(x)
+        logits = self.proj(self.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+
+
+########################################
+#              Optimizer               #
+########################################
+
+def _compute_dtype(dtype_name: str):
+    if dtype_name == "bfloat16":
+        return torch.bfloat16
+    if dtype_name == "float32":
+        return torch.float32
+    if dtype_name == "float64":
+        return torch.float64
+    raise ValueError(f"Unsupported orthogonalization dtype: {dtype_name!r}")
+
+
+def _accum_dtype(dtype_name: str):
+    return torch.float64 if dtype_name == "float64" else torch.float32
+
+
+def augmented_ns(X: Tensor, A: Tensor, ns_iters: int = 6,
+                 ns_coeffs: tuple = (2, -1.5, 0.5),
+                 eps: float = 1e-9, compute_dtype: str = "bfloat16") -> Tensor:
+    """
+    AugmentedNS(M, A): compute (M Mᵀ + A)^{-1/2} M via a coupled Newton–Schulz iteration
+    that updates an internal A alongside X.
+
+    A is the smaller-side augmentation (shape min_D × min_D).
+    For wide X (m < n): iterates X ← aX + B·X with A ← (aI+B)A(aI+B); B = bA + cA²
+        ⇒ (X Xᵀ + A)^{-1/2} X
+    For tall X (m ≥ n): iterates X ← aX + X·B with the same A update
+        ⇒ X (Xᵀ X + A)^{-1/2}  (equivalent under the transpose-to-smaller-side convention).
+    """
+    is_tall = X.size(-2) >= X.size(-1)
+    x_dtype = _compute_dtype(compute_dtype)
+    accum_dtype = _accum_dtype(compute_dtype)
+
+    X = X.to(dtype=x_dtype)
+    A = A.to(dtype=accum_dtype)
+    A = 0.5 * (A + A.transpose(-2, -1))  # ensure symmetry
+
+    # Scale so that tr(X Xᵀ + A) ≈ 1; the (1 + 2e-2)² cushion keeps the iteration inside
+    # the basin of attraction even when our X / A estimate of the trace is slightly off.
+    tr = X.to(dtype=accum_dtype).pow(2).sum(dim=(-2, -1), keepdim=True) \
+       + A.diagonal(dim1=-2, dim2=-1).sum(dim=-1, keepdim=True).unsqueeze(-1)
+    tr = tr.clamp_min(1e-12) * ((1 + 2e-2)**2)
+    inv_sqrt_tr = tr.rsqrt()
+    inv_tr = inv_sqrt_tr.square()
+
+    X = X * inv_sqrt_tr.to(X.dtype)
+    A = (A * inv_tr).contiguous()
+
+    # Initial augmented Gram: A₀ ← A + gram_smaller_side(X)
+    if is_tall:
+        A = A + (X.mT @ X)
+    else:
+        A = A + (X @ X.mT)
+    A.diagonal(dim1=-2, dim2=-1).add_(eps)
+
+    a, b, c = ns_coeffs
+    last_iter = ns_iters - 1
+    for i in range(ns_iters):
+        A = 0.5 * (A + A.transpose(-2, -1))
+        B = b * A + c * (A @ A)
+
+        if is_tall:
+            X = a * X + X @ B.to(X.dtype)
+        else:
+            X = a * X + B.to(X.dtype) @ X
+
+        if i < last_iter:
+            # A ← (aI + B) A (aI + B) computed as D = aA + B·A then A = aD + D·B
+            D = a * A + B @ A
+            A = a * D + D @ B
+
+    return X
+
+
+class OneSidedShampoo(torch.optim.Optimizer):
+    """
+    One-sided Shampoo via AugmentedNS.
+
+    Maintains per-param state (M, V, λ) satisfying L_t = (1/λ_t) M_t M_tᵀ + V_t exactly,
+    where L_t is the EMA of G_t G_tᵀ. The update direction is
+
+        L_t^{-1/2} M_t = √λ_t · AugmentedNS(M_t, λ_t V_t).
+
+    The state recursion (see one_sided_shampoo_augmentedns.md §2.2) uses the pre-update
+    M_{t-1} and λ_{t-1}; the t=1 case (λ₀ = 0) is guarded so the M_{t-1} term — formally
+    `√(β₂/(λ₀ λ₁)) · M₀ = ∞ · 0` — is dropped instead of evaluated.
+    """
+    def __init__(self, params, lr=0.025, weight_decay=0.025,
+                 beta1=0.9, beta2=0.95, ns_iters=6, eps=1e-9,
+                 orthogonalize_dtype="bfloat16"):
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, beta1=beta1, beta2=beta2,
+                        ns_iters=ns_iters, eps=eps,
+                        orthogonalize_dtype=orthogonalize_dtype)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            b1 = float(group["beta1"])
+            b2 = float(group["beta2"])
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["M"] = torch.zeros_like(p, dtype=torch.float32)
+                        D1, D2 = p.shape[-2], p.shape[-1]
+                        min_D = min(D1, D2)
+                        state["V"] = torch.zeros(
+                            min_D, min_D, dtype=torch.float32, device=p.device
+                        )
+                        state["lambda"] = 0.0
+
+                    grad = p.grad.float()
+                    M = state["M"]
+                    V = state["V"]
+                    lam_prev = float(state["lambda"])
+                    lam_t = (b1 * b1 / b2) * lam_prev + (1.0 - b1)**2 / (1.0 - b2)
+
+                    # spec §2.3 guard: at t=1, lam_prev==0 ⇒ N_1 = 0 (drop the ∞·0 term)
+                    if lam_prev == 0.0:
+                        N = torch.zeros_like(grad)
+                    else:
+                        cg = math.sqrt((b1 * b1 * lam_prev) / (b2 * lam_t))
+                        cm = ((1.0 - b1) / (1.0 - b2)) * math.sqrt(b2 / (lam_prev * lam_t))
+                        N = cg * grad - cm * M
+
+                    # update V on the smaller side, then M, then λ (uses M_{t-1}, λ_{t-1} above)
+                    is_tall = p.size(-2) >= p.size(-1)
+                    NN = (N.mT @ N) if is_tall else (N @ N.mT)
+                    V.mul_(b2).add_(NN, alpha=(1.0 - b2))
+                    M.mul_(b1).add_(grad, alpha=(1.0 - b1))
+                    state["lambda"] = lam_t
+
+                    A = lam_t * V
+                    direction = augmented_ns(
+                        M, A,
+                        ns_iters=group["ns_iters"], eps=group["eps"],
+                        compute_dtype=group["orthogonalize_dtype"],
+                    )
+                    direction *= max(1, p.size(-2) / p.size(-1))**0.5
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(direction, alpha=-group["lr"])
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+
+########################################
+#                Setup                 #
+########################################
+
+def main():
+    args = parse_args()
+    num_trials = args.trials if args.trials is not None else (args.legacy_trials or 1)
+    hparams = resolve_hparams(args.set)
+    validate_hparams(hparams)
+
+    if args.dry_run:
+        run_dir = create_run_dir(args.out_dir)
+        write_run_files(run_dir, args, hparams, "dry-run")
+        print(f"dry_run:true out_dir:{run_dir}")
+        print(json.dumps(dict(hparams=hparams, config_diff=config_diff(hparams)), indent=2, sort_keys=True))
+        return
+
+    global device
+    # torchrun sets these env variables
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    dist.barrier()
+    # this code can be run equivalently with 1, 2, 4, or 8 gpus.
+    assert 8 % dist.get_world_size() == 0
+
+    try:
+        if dist.get_rank() == 0:
+            run_dir = create_run_dir(args.out_dir)
+        else:
+            run_dir = None
+        run_dir_obj = [str(run_dir) if run_dir is not None else None]
+        dist.broadcast_object_list(run_dir_obj, src=0)
+        run_dir = Path(run_dir_obj[0])
+        logfile = run_dir / "train.log"
+
+        # logging setup
+        if dist.get_rank() == 0:
+            print(logfile)
+            write_run_files(run_dir, args, hparams, "train", dict(
+                device_name=torch.cuda.get_device_name(device),
+                world_size=dist.get_world_size(),
+            ))
+
+        wandb_run = None
+        if hparams["wandb_project"] is not None and dist.get_rank() == 0:
+            try:
+                import wandb
+                wandb_run = wandb.init(
+                    project=hparams["wandb_project"],
+                    mode=hparams.get("wandb_mode", "online"),
+                    name=hparams.get("wandb_run_name") or run_dir.name,
+                    dir=str(run_dir),
+                    config=hparams,
+                    tags=[Path(__file__).stem, f"world_size={dist.get_world_size()}"],
+                )
+            except Exception as e:
+                print(f"[wandb] init failed, continuing without wandb: {e}")
+                wandb_run = None
+
+        def print0(s, console=False, log=True):
+            if dist.get_rank() == 0:
+                if console:
+                    print(s)
+                if log:
+                    with open(logfile, "a") as f:
+                        print(s, file=f)
+
+        # we begin by logging this file itself
+        print0(code)
+        print0("="*100)
+        print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+               + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
+        print0(json.dumps(dict(hparams=hparams, config_diff=config_diff(hparams)), indent=2, sort_keys=True))
+        print0("="*100)
+
+        val_tokens = 20 * 524288
+        batch_size = 8 * 64 * 1024
+        mbs = 64
+        val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+
+        model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
+        model.compile(dynamic=False)
+
+        for _ in range(num_trials):
+
+
+            ########################################
+            #            Hyperparameters            #
+            ########################################
+
+            train_steps = hparams["train_steps"]
+
+            # initialize model parameters
+            for name, p in model.named_parameters():
+                w = p.data
+                if name.endswith("weight"):
+                    if "proj" in name:
+                        w.zero_()
+                    elif "embed" in name:
+                        w.normal_()  # default torch init
+                    else:
+                        w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+                elif name.endswith("bias"):
+                    w.zero_()
+                elif name.endswith("gains"):
+                    w.normal_(mean=1, std=0)
+                else:
+                    raise Exception(f"Uninitialized parameter: {name}")
+
+            # create the optimizer(s)
+            optimizer1 = AdamW([dict(params=[model.embed.weight], lr=hparams["embed_lr"]),
+                                dict(params=[model.proj.weight], lr=hparams["proj_lr"]),
+                                dict(params=[p for p in model.parameters() if p.ndim < 2], lr=hparams["scalar_lr"])],
+                               betas=hparams["adam_betas"], eps=hparams["adam_eps"],
+                               weight_decay=hparams["adam_wd"], fused=True)
+            optimizer2 = OneSidedShampoo([p for p in model.blocks.parameters() if p.ndim >= 2],
+                                         lr=hparams["shampoo_lr"], weight_decay=hparams["shampoo_wd"],
+                                         beta1=hparams["shampoo_beta1"], beta2=hparams["shampoo_beta2"],
+                                         ns_iters=hparams["shampoo_ns_iters"], eps=hparams["shampoo_eps"],
+                                         orthogonalize_dtype=hparams["shampoo_orthogonalize_dtype"])
+            optimizers = [optimizer1, optimizer2]
+            assert set(p for opt in optimizers for group in opt.param_groups
+                       for p in group["params"]) == set(model.parameters())
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["initial_lr"] = group["lr"]
+            for group in optimizer1.param_groups:
+                group["cooldown_frac"] = hparams["adam_cooldown_frac"]
+            for group in optimizer2.param_groups:
+                group["cooldown_frac"] = hparams["shampoo_cooldown_frac"]
+
+            # learning rate schedule: stable then decay
+            def set_hparams(step):
+                progress = step / train_steps
+                assert 0 <= progress < 1
+                for opt in optimizers:
+                    for group in opt.param_groups:
+                        cooldown_frac = group["cooldown_frac"]
+                        if progress < 1 - cooldown_frac:
+                            eta = 1.0
+                        else:
+                            eta = (1 - progress) / cooldown_frac
+                        group["lr"] = group["initial_lr"] * eta
+
+
+            ########################################
+            #        Training and Validation       #
+            ########################################
+
+            train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+            for p in model.parameters():
+                dist.broadcast(p.detach(), 0)
+            # start the clock
+            training_time = 0
+            last_val_step = 0
+            dist.barrier()
+            t0 = time.perf_counter()
+            for step in range(train_steps + 1):
+
+                # --------------- VALIDATION SECTION -----------------
+                if step == train_steps or step % 125 == 0:
+                    # stop the clock
+                    dist.barrier()
+                    time_since_last_val = time.perf_counter() - t0
+                    step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
+                    last_val_step = step
+                    training_time += time_since_last_val
+                    model.eval()
+                    val_loss = 0
+                    with torch.no_grad():
+                        assert len(val_inputs) % mbs == 0
+                        for i in range(len(val_inputs) // mbs):
+                            val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+                    dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+                    val_loss /= val_tokens
+                    print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+                           + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+                    if wandb_run is not None:
+                        wandb_run.log({
+                            "val_loss": float(val_loss),
+                            "train_time_s": training_time,
+                            "step_avg_ms": 1000 * step_avg if step > 0 else 0.0,
+                        }, step=step)
+                    model.train()
+                    # start the clock again
+                    dist.barrier()
+                    t0 = time.perf_counter()
+
+                if step == train_steps:
+                    break
+
+                # --------------- TRAINING SECTION -----------------
+                inputs, targets = next(train_loader)
+                # accumulate across microbatches in case we are running with fewer than 8 gpus
+                assert len(inputs) % mbs == 0
+                for i in range(len(inputs) // mbs):
+                    model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+                for name, p in model.named_parameters():
+                    assert p.grad is not None, name
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                # set optimization hyperparameters and take a step
+                set_hparams(step)
+                for opt in optimizers:
+                    opt.step()
+                model.zero_grad(set_to_none=True)
+                approx_training_time = training_time + (time.perf_counter() - t0)
+                print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+                       + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+    finally:
+        if 'wandb_run' in locals() and wandb_run is not None:
+            wandb_run.finish()
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+Running PyTorch 2.11.0+cu128 compiled for CUDA 12.8 on NVIDIA H100 NVL with world_size 4
+{
+  "config_diff": {
+    "shampoo_beta1": 0.8,
+    "shampoo_beta2": 0.7,
+    "shampoo_cooldown_frac": 0.6,
+    "shampoo_eps": 1e-12,
+    "shampoo_lr": 0.07,
+    "shampoo_ns_iters": 12,
+    "shampoo_orthogonalize_dtype": "float32",
+    "shampoo_wd": 0.0275,
+    "train_steps": 1500,
+    "wandb_project": "modded-nanogpt-track3",
+    "wandb_run_name": "oss-round2-lr0070_b8070"
+  },
+  "hparams": {
+    "adam_betas": [
+      0.8,
+      0.95
+    ],
+    "adam_cooldown_frac": 0.7,
+    "adam_eps": 1e-10,
+    "adam_wd": 0.0,
+    "embed_lr": 0.3,
+    "proj_lr": 0.003125,
+    "scalar_lr": 0.01,
+    "shampoo_beta1": 0.8,
+    "shampoo_beta2": 0.7,
+    "shampoo_cooldown_frac": 0.6,
+    "shampoo_eps": 1e-12,
+    "shampoo_lr": 0.07,
+    "shampoo_ns_iters": 12,
+    "shampoo_orthogonalize_dtype": "float32",
+    "shampoo_wd": 0.0275,
+    "train_steps": 1500,
+    "wandb_mode": "online",
+    "wandb_project": "modded-nanogpt-track3",
+    "wandb_run_name": "oss-round2-lr0070_b8070"
+  }
+}
+====================================================================================================
+step:0/1500 val_loss:10.82584 train_time:0.000s step_avg:nanms
+step:125/1500 val_loss:4.55356 train_time:60.366s step_avg:482.93ms
+step:250/1500 val_loss:4.14075 train_time:118.344s step_avg:463.82ms
+step:375/1500 val_loss:3.98592 train_time:176.102s step_avg:462.06ms
+step:500/1500 val_loss:3.89874 train_time:233.839s step_avg:461.89ms
+step:625/1500 val_loss:3.82558 train_time:294.270s step_avg:483.45ms
+step:750/1500 val_loss:3.76255 train_time:361.774s step_avg:540.03ms
+step:875/1500 val_loss:3.69712 train_time:429.308s step_avg:540.27ms
+step:1000/1500 val_loss:3.64459 train_time:496.831s step_avg:540.18ms
+step:1125/1500 val_loss:3.59696 train_time:556.775s step_avg:479.55ms
+step:1250/1500 val_loss:3.54714 train_time:614.501s step_avg:461.81ms
+step:1375/1500 val_loss:3.50391 train_time:672.255s step_avg:462.04ms
+step:1500/1500 val_loss:3.47402 train_time:730.026s step_avg:462.17ms

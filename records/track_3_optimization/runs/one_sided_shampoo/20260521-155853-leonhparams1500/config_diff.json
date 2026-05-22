@@ -1,0 +1,6 @@
+{
+  "shampoo_beta1": 0.95,
+  "train_steps": 1500,
+  "wandb_project": "modded-nanogpt-track3",
+  "wandb_run_name": "oss-leonhparams-1500"
+}
