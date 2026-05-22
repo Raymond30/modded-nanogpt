@@ -87,13 +87,13 @@ Recommended stats:
 
 | Stat | Why it helps |
 | --- | --- |
-| `||W||_F` | Detects whether nonzero `L` changes weight growth/shrinkage. Useful but not sufficient alone. |
-| `||grad||_F` | Shows whether the loss trajectory changes are reflected in gradient scale. |
-| `||momentum||_F` | Separates raw gradient scale from Nesterov update scale. |
-| `||update||_F` before LR | Directly tests whether `L` reduces effective update magnitude. |
-| `lr * ||update||_F / ||W||_F` | Best scalar for effective relative step size. |
-| `tr(L)` and `||L||_F` | Shows how large the second-momentum contribution becomes. |
-| `tr(L) / (||G||_F^2 + tr(L))` | Measures how much trace normalization is dominated by stale `L`. |
+| `\|\|W\|\|_F` | Detects whether nonzero `L` changes weight growth/shrinkage. Useful but not sufficient alone. |
+| `\|\|grad\|\|_F` | Shows whether the loss trajectory changes are reflected in gradient scale. |
+| `\|\|momentum\|\|_F` | Separates raw gradient scale from Nesterov update scale. |
+| `\|\|update\|\|_F` before LR | Directly tests whether `L` reduces effective update magnitude. |
+| `lr * \|\|update\|\|_F / \|\|W\|\|_F` | Best scalar for effective relative step size. |
+| `tr(L)` and `\|\|L\|\|_F` | Shows how large the second-momentum contribution becomes. |
+| `tr(L) / (\|\|G\|\|_F^2 + tr(L))` | Measures how much trace normalization is dominated by stale `L`. |
 | `cos(update_L, update_L0)` | Tests whether `L` mostly rescales or rotates the update. |
 | `cos(update, grad)` and `cos(update, momentum)` | Tests whether the final update remains aligned with current signal. |
 | Top eigenvalue / trace of `L` | Detects whether `L` is directionally concentrated and acting like a strong anisotropic preconditioner. |
