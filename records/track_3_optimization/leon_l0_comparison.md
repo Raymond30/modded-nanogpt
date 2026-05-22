@@ -160,7 +160,7 @@ This largely fixes the scaling issue for `l_scale=1.0`. The new full-`L` traject
 
 The diagnostic averages below are means over the three logged tensors: `blocks.0.attn.q.weight`, `blocks.6.mlp.proj.weight`, and `blocks.11.attn.proj.weight`.
 
-| Scale | Step | `tr(L)` fraction | `||update_L|| / ||update_L0||` | `cos(update_L, update_L0)` | Relative step |
+| Scale | Step | `tr(L)` fraction | `\|\|update_L\|\| / \|\|update_L0\|\|` | `cos(update_L, update_L0)` | Relative step |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1.00 | 125 | 0.988 | 0.173 | 0.882 | 0.00965 |
 | 1.00 | 250 | 0.988 | 0.160 | 0.903 | 0.00637 |
@@ -187,7 +187,7 @@ Interpretation:
 
 Under the current unnormalized-sum full-`L` codepath, the corresponding averages moved to:
 
-| Step | `tr(L)` fraction | `||update_L|| / ||update_L0||` | `cos(update_L, update_L0)` | Relative step |
+| Step | `tr(L)` fraction | `\|\|update_L\|\| / \|\|update_L0\|\|` | `cos(update_L, update_L0)` | Relative step |
 | ---: | ---: | ---: | ---: | ---: |
 | 125 | 0.498 | 0.784 | 0.983 | 0.01948 |
 | 250 | 0.451 | 0.800 | 0.988 | 0.01040 |
