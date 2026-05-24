@@ -47,6 +47,12 @@ BASE_HPARAMS = dict(
     leon_l_scale_schedule = "constant",
     leon_l_scale_ramp_start_frac = 0.2,
     leon_l_scale_ramp_end_frac = 0.6,
+    # "off": L = l_scale * T_t (raw unnormalized Gram sum).
+    # "match_g": rescale L so tr(L) = l_scale * ||G||_F^2 (l_scale=1.0 -> tr(L) fraction 0.5).
+    leon_l_normalize_mode = "off",
+    # When True, rescale the final NS output to Frobenius norm sqrt(min(D1, D2)),
+    # i.e. match the natural ||update||_F of the L=0 (Muon-NS) update.
+    leon_match_l0_norm  = False,
     leon_log_diagnostics = False,
     leon_diag_interval  = 125,
     leon_diag_patterns  = (
@@ -131,6 +137,13 @@ def validate_hparams(hparams):
                 "< leon_l_scale_ramp_end_frac <= 1, "
                 f"got start={start!r}, end={end!r}"
             )
+
+    normalize_mode = hparams["leon_l_normalize_mode"]
+    if normalize_mode not in ("off", "match_g"):
+        raise ValueError(
+            "leon_l_normalize_mode must be 'off' or 'match_g', "
+            f"got {normalize_mode!r}"
+        )
 
 
 def scheduled_l_scale(hparams, progress):
@@ -381,7 +394,9 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
                        momentum: float = 0.95, beta2: float = 0.7,
                        ns_iters: int = 6, ns_coeffs: tuple = (2, -1.5, 0.5),
                        eps: float = 1e-7, l_scale: float = 1.0,
-                       compute_dtype: str = "bfloat16") -> Tensor:
+                       compute_dtype: str = "bfloat16",
+                       l_normalize_mode: str = "off",
+                       match_l0_norm: bool = False) -> Tensor:
     """
     Leon update: Nesterov momentum + Newton-Schulz orthogonalization with
     augmented Gram matrix (second momentum buffer).
@@ -390,16 +405,22 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
     using Newton-Schulz iterations to approximate the matrix inverse square root.
 
     Args:
-        grad: Raw gradient (will be mutated in-place for momentum)
-        momentum_buffer: First momentum buffer (EMA of gradients)
-        second_momentum_buffer: Second momentum buffer (EMA of Gram matrices)
+        grad: Raw gradient (mutated in-place into the Nesterov-corrected update)
+        momentum_buffer: First-moment unnormalized exponential sum
+            S_t = momentum * S_{t-1} + grad_t (updated in place).
+        second_momentum_buffer: Second-moment unnormalized exponential sum
+            T_t = beta2 * T_{t-1} + grad_t grad_t^T (updated in place).
         momentum: First momentum coefficient (Nesterov)
-        beta2: Second momentum coefficient (Gram EMA)
+        beta2: Second momentum coefficient
         ns_iters: Number of Newton-Schulz iterations
         ns_coeffs: (a, b, c) coefficients for the NS iteration
         eps: Diagonal stability epsilon added to the augmented Gram matrix
         l_scale: Multiplier for the second-momentum Gram contribution
         compute_dtype: Matrix-update dtype for X inside the NS iteration
+        l_normalize_mode: "off" uses L = l_scale * T_t; "match_g" rescales L so
+            tr(L) = l_scale * ||G||_F^2 (l_scale=1.0 -> tr(L) fraction 0.5).
+        match_l0_norm: When True, rescale the final NS output to Frobenius norm
+            sqrt(min(D1, D2)), matching the L=0 update's natural Frobenius norm.
     """
     is_tall = grad.size(-2) >= grad.size(-1)
     x_dtype = leon_compute_dtype(compute_dtype)
@@ -411,17 +432,27 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
     else:
         gram_tmp = grad @ grad.mT
 
-    # 1. Update first momentum (Nesterov)
-    momentum_buffer.lerp_(grad, 1 - momentum)
-    g = grad.lerp_(momentum_buffer, momentum)  # in-place
-    g.div_(1 - momentum)
+    # Both buffers are stored as unnormalized exponential sums:
+    #   S_t = momentum * S_{t-1} + grad_t          (first moment)
+    #   T_t = beta2    * T_{t-1} + grad_t grad_t^T (second moment)
+    # so we avoid the lerp_ / divide-by-(1-decay) round-trip used in EMA storage.
 
-    # 2. Update second momentum (Gram EMA)
-    second_momentum_buffer.lerp_(gram_tmp, 1 - beta2)
+    # 1. First-moment sum + Nesterov: g = grad + momentum * S_t
+    momentum_buffer.mul_(momentum).add_(grad)
+    g = grad.add_(momentum_buffer, alpha=momentum)
+
+    # 2. Second-moment sum: T_t in place
+    second_momentum_buffer.mul_(beta2).add_(gram_tmp)
 
     X = g.to(dtype=x_dtype)
-    second_momentum_for_update = second_momentum_buffer.to(dtype=accum_dtype) / (1 - beta2)
-    L = second_momentum_for_update * l_scale
+    L_unscaled = second_momentum_buffer.to(dtype=accum_dtype)
+    if l_normalize_mode == "match_g":
+        x_sq = X.to(dtype=accum_dtype).pow(2).sum()
+        raw_l_tr = L_unscaled.diagonal(dim1=-2, dim2=-1).sum().clamp_min(1e-12)
+        # Rescale so tr(L) = l_scale * ||X||_F^2 regardless of the raw sum magnitude.
+        L = L_unscaled * (l_scale * x_sq / raw_l_tr)
+    else:
+        L = L_unscaled * l_scale
     A = 0.5 * (L + L.transpose(-2, -1))  # ensure symmetry
 
     # 3. Scale so that tr(GG^T + L) ≈ 1
@@ -461,6 +492,13 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
             D = a * A + B @ A
             A = a * D + D @ B
 
+    if match_l0_norm:
+        # Rescale X to ||X||_F = sqrt(min(D1, D2)), the natural Frobenius norm
+        # of an orthogonalized (L=0) Muon-NS update.
+        target = float(min(X.size(-2), X.size(-1))) ** 0.5
+        cur = X.to(dtype=accum_dtype).norm().clamp_min(1e-12)
+        X = X * (target / cur).to(X.dtype)
+
     return X
 
 
@@ -474,12 +512,15 @@ class Leon(torch.optim.Optimizer):
     the iteration matrix: A = X@X^T + L. A is also iterated alongside X.
     """
     def __init__(self, params, lr=0.025, weight_decay=0.025, mu=0.95, beta2=0.7,
-                 ns_iters=6, eps=1e-7, l_scale=1.0, orthogonalize_dtype="bfloat16"):
+                 ns_iters=6, eps=1e-7, l_scale=1.0, orthogonalize_dtype="bfloat16",
+                 l_normalize_mode="off", match_l0_norm=False):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, beta2=beta2,
                         ns_iters=ns_iters, eps=eps, l_scale=l_scale,
-                        orthogonalize_dtype=orthogonalize_dtype)
+                        orthogonalize_dtype=orthogonalize_dtype,
+                        l_normalize_mode=l_normalize_mode,
+                        match_l0_norm=match_l0_norm)
         super().__init__(params, defaults)
         self.param_names = {}
 
@@ -525,6 +566,8 @@ class Leon(torch.optim.Optimizer):
                         ns_iters=group["ns_iters"], eps=group["eps"],
                         l_scale=group["l_scale"],
                         compute_dtype=group["orthogonalize_dtype"],
+                        l_normalize_mode=group["l_normalize_mode"],
+                        match_l0_norm=group["match_l0_norm"],
                     )
                     update *= max(1, p.size(-2) / p.size(-1))**0.5
 
@@ -546,8 +589,10 @@ class Leon(torch.optim.Optimizer):
                     cosine_denom = (update_norm * update_l0_norm).clamp_min(1e-12)
                     update_l0_cos = (update_float.flatten() @ update_l0_float.flatten()) / cosine_denom
                     grad_norm = grad.norm()
-                    momentum_for_stats = momentum_clone / (1 - group["mu"])
-                    l_for_stats = l_clone / (1 - group["beta2"])
+                    # momentum_clone / l_clone are post-`leon_orthogonalize`, so they already
+                    # hold the unnormalized exponential sums S_t and T_t. No 1/(1-decay) factor.
+                    momentum_for_stats = momentum_clone
+                    l_for_stats = l_clone
                     momentum_norm = momentum_for_stats.norm()
                     update_grad_cos = (update_float.flatten() @ grad.flatten()) / (
                         update_norm * grad_norm
@@ -561,8 +606,13 @@ class Leon(torch.optim.Optimizer):
                     l_fro = l_sym.norm()
                     diagnostic_accum_dtype = leon_accum_dtype(group["orthogonalize_dtype"])
                     g_sq = grad_for_update.to(dtype=diagnostic_accum_dtype).pow(2).sum()
-                    scaled_l_trace = group["l_scale"] * l_trace
-                    l_trace_fraction = scaled_l_trace / (g_sq + scaled_l_trace).clamp_min(1e-12)
+                    # Reflect the actual effective tr(L) used inside leon_orthogonalize:
+                    # match_g rescales tr(L) to l_scale * ||g||^2, off uses l_scale * tr(L_unscaled).
+                    if group["l_normalize_mode"] == "match_g":
+                        effective_l_trace = group["l_scale"] * g_sq
+                    else:
+                        effective_l_trace = group["l_scale"] * l_trace
+                    l_trace_fraction = effective_l_trace / (g_sq + effective_l_trace).clamp_min(1e-12)
                     if l_trace > 0:
                         l_top_eval = torch.linalg.eigvalsh(l_sym).amax().clamp_min(0)
                         l_top_eval_fraction = l_top_eval / l_trace.clamp_min(1e-12)
@@ -571,8 +621,10 @@ class Leon(torch.optim.Optimizer):
                         l_top_eval_fraction = l_trace
 
                     weight_norm = p.float().norm()
-                    relative_update = group["lr"] * update_norm / weight_norm.clamp_min(1e-12)
-                    relative_update_l0 = group["lr"] * update_l0_norm / weight_norm.clamp_min(1e-12)
+                    # LR-free shape metric: ||update||_F / ||W||_F. Multiply by lr (also
+                    # logged) to recover the per-step relative move.
+                    relative_update = update_norm / weight_norm.clamp_min(1e-12)
+                    relative_update_l0 = update_l0_norm / weight_norm.clamp_min(1e-12)
 
                     rows.append(dict(
                         name=name,
@@ -620,6 +672,8 @@ class Leon(torch.optim.Optimizer):
                         ns_iters=group["ns_iters"], eps=group["eps"],
                         l_scale=group["l_scale"],
                         compute_dtype=group["orthogonalize_dtype"],
+                        l_normalize_mode=group["l_normalize_mode"],
+                        match_l0_norm=group["match_l0_norm"],
                     )
                     update *= max(1, p.size(-2) / p.size(-1))**0.5
                     p.mul_(1 - group["lr"] * group["weight_decay"])
@@ -748,7 +802,9 @@ def main():
                               mu=hparams["leon_mu"], beta2=hparams["leon_beta2"],
                               ns_iters=hparams["leon_ns_iters"], eps=hparams["leon_eps"],
                               l_scale=hparams["leon_l_scale"],
-                              orthogonalize_dtype=hparams["leon_orthogonalize_dtype"])
+                              orthogonalize_dtype=hparams["leon_orthogonalize_dtype"],
+                              l_normalize_mode=hparams["leon_l_normalize_mode"],
+                              match_l0_norm=hparams["leon_match_l0_norm"])
             optimizer2.param_names = {p: name for name, p in model.named_parameters()}
             optimizers = [optimizer1, optimizer2]
             assert set(p for opt in optimizers for group in opt.param_groups
