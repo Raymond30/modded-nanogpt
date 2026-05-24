@@ -1,0 +1,1053 @@
+"""
+train_gpt_simple_leon.py
+
+This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
+It was prepared as a simplified version of the speedrun for use in neural net optimization research.
+This variant replaces Muon with Leon (initial test using the same Newton-Schulz coefficients).
+"""
+
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import argparse
+import ast
+import json
+import subprocess
+import uuid
+import time
+from datetime import datetime
+from pathlib import Path
+
+
+BASE_HPARAMS = dict(
+    # Training
+    train_steps         = 3375,
+    # AdamW — embedding
+    embed_lr            = 0.3,
+    # AdamW — lm_head projection
+    proj_lr             = 1/320,
+    # AdamW — scalars (biases, gains)
+    scalar_lr           = 0.01,
+    # AdamW shared
+    adam_betas          = (0.8, 0.95),
+    adam_eps            = 1e-10,
+    adam_wd             = 0.0,
+    adam_cooldown_frac  = 0.7,
+    # Leon — 2D block params
+    leon_lr             = 0.025,
+    leon_wd             = 0.025,
+    leon_mu             = 0.95,
+    leon_beta2          = 0.7,
+    leon_cooldown_frac  = 0.7,
+    leon_ns_iters       = 6,
+    leon_eps            = 1e-9,
+    leon_l_scale        = 1.0,
+    leon_orthogonalize_dtype = "bfloat16",
+    leon_l_scale_schedule = "constant",
+    leon_l_scale_ramp_start_frac = 0.2,
+    leon_l_scale_ramp_end_frac = 0.6,
+    # "off": L = l_scale * T_t (raw unnormalized Gram sum).
+    # "match_g": rescale L so tr(L) = l_scale * ||G||_F^2 (l_scale=1.0 -> tr(L) fraction 0.5).
+    leon_l_normalize_mode = "off",
+    # When True, rescale the final NS output to Frobenius norm sqrt(min(D1, D2)),
+    # i.e. match the natural ||update||_F of the L=0 (Muon-NS) update.
+    leon_match_l0_norm  = False,
+    leon_log_diagnostics = False,
+    leon_diag_interval  = 125,
+    leon_diag_patterns  = (
+        "blocks.0.attn.q.weight",
+        "blocks.6.mlp.proj.weight",
+        "blocks.11.attn.proj.weight",
+    ),
+    # Optional wandb logging (off by default). Enable with --set wandb_project=<name>.
+    # File artifacts (train.log, config.json, tuning_log.csv) remain authoritative.
+    wandb_project = None,
+    wandb_mode    = "online",  # "online" | "offline" | "disabled"
+    # Optional. If unset, the wandb run name falls back to run_dir.name (the timestamp+uuid).
+    # Set this to your tuning_log.csv run_id so the dashboard matches the ledger.
+    wandb_run_name = None,
+)
+
+
+def parse_value(s: str):
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError):
+        return s
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("legacy_trials", nargs="?", type=int,
+                        help="Legacy positional trial count. Prefer --trials.")
+    parser.add_argument("--trials", type=int, default=None)
+    parser.add_argument("--set", action="append", default=[],
+                        metavar="KEY=VALUE", help="Override or add an hparams entry.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Resolve config and write metadata without CUDA/NCCL/training.")
+    parser.add_argument("--out-dir", type=Path, default=None,
+                        help="Run output directory. Defaults to runs/leon/<timestamp>-<uuid>.")
+    return parser.parse_args()
+
+
+def resolve_hparams(overrides):
+    hparams = dict(BASE_HPARAMS)
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"--set expects KEY=VALUE, got {item!r}")
+        key, raw_value = item.split("=", 1)
+        value = parse_value(raw_value)
+        if key == "cooldown_frac":
+            hparams["adam_cooldown_frac"] = value
+            hparams["leon_cooldown_frac"] = value
+        hparams[key] = value
+    return hparams
+
+
+def config_diff(hparams):
+    return {k: v for k, v in hparams.items() if BASE_HPARAMS.get(k) != v}
+
+
+def validate_hparams(hparams):
+    l_scale = float(hparams["leon_l_scale"])
+    if l_scale < 0:
+        raise ValueError(f"leon_l_scale must be non-negative, got {l_scale!r}")
+
+    orthogonalize_dtype = hparams["leon_orthogonalize_dtype"]
+    if orthogonalize_dtype not in ("bfloat16", "float32", "float64"):
+        raise ValueError(
+            "leon_orthogonalize_dtype must be 'bfloat16', 'float32', or 'float64', "
+            f"got {orthogonalize_dtype!r}"
+        )
+
+    schedule = hparams["leon_l_scale_schedule"]
+    if schedule not in ("constant", "linear_ramp"):
+        raise ValueError(
+            "leon_l_scale_schedule must be 'constant' or 'linear_ramp', "
+            f"got {schedule!r}"
+        )
+
+    if schedule == "linear_ramp":
+        start = float(hparams["leon_l_scale_ramp_start_frac"])
+        end = float(hparams["leon_l_scale_ramp_end_frac"])
+        if not (0 <= start < end <= 1):
+            raise ValueError(
+                "linear_ramp requires 0 <= leon_l_scale_ramp_start_frac "
+                "< leon_l_scale_ramp_end_frac <= 1, "
+                f"got start={start!r}, end={end!r}"
+            )
+
+    normalize_mode = hparams["leon_l_normalize_mode"]
+    if normalize_mode not in ("off", "match_g"):
+        raise ValueError(
+            "leon_l_normalize_mode must be 'off' or 'match_g', "
+            f"got {normalize_mode!r}"
+        )
+
+
+def scheduled_l_scale(hparams, progress):
+    target = float(hparams["leon_l_scale"])
+    schedule = hparams["leon_l_scale_schedule"]
+
+    if schedule == "constant":
+        return target
+
+    start = float(hparams["leon_l_scale_ramp_start_frac"])
+    end = float(hparams["leon_l_scale_ramp_end_frac"])
+    if progress < start:
+        return 0.0
+    if progress >= end:
+        return target
+    ramp_progress = (progress - start) / (end - start)
+    return target * ramp_progress
+
+
+def default_run_dir():
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path("records/track_3_optimization/runs/leon") / f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def create_run_dir(out_dir=None):
+    run_dir = Path(out_dir) if out_dir is not None else default_run_dir()
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def git_commit():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return None
+
+
+def shard_counts():
+    cwd = Path.cwd()
+    return dict(
+        train_shards=len(list(cwd.glob("data/fineweb10B/fineweb_train_*.bin"))),
+        val_shards=len(list(cwd.glob("data/fineweb10B/fineweb_val_*.bin"))),
+    )
+
+
+def torch_versions():
+    torch_module = globals().get("torch")
+    if torch_module is None:
+        return None, None
+    return torch_module.version.__version__, torch_module.version.cuda
+
+
+def write_run_files(run_dir, args, hparams, mode, extra=None):
+    torch_version, cuda_version = torch_versions()
+    diff = config_diff(hparams)
+    metadata = dict(
+        mode=mode,
+        argv=sys.argv,
+        cwd=str(Path.cwd()),
+        script=sys.argv[0],
+        trials=args.trials if args.trials is not None else (args.legacy_trials or 1),
+        dry_run=args.dry_run,
+        out_dir=str(run_dir),
+        git_commit=git_commit(),
+        torch_version=torch_version,
+        cuda_version=cuda_version,
+        shard_counts=shard_counts(),
+    )
+    if extra:
+        metadata.update(extra)
+    (run_dir / "config.json").write_text(json.dumps(hparams, indent=2, sort_keys=True) + "\n")
+    (run_dir / "config_diff.json").write_text(json.dumps(diff, indent=2, sort_keys=True) + "\n")
+    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+
+
+if "--dry-run" in sys.argv:
+    args = parse_args()
+    hparams = resolve_hparams(args.set)
+    validate_hparams(hparams)
+    run_dir = create_run_dir(args.out_dir)
+    write_run_files(run_dir, args, hparams, "dry-run")
+    print(f"dry_run:true out_dir:{run_dir}")
+    print(json.dumps(dict(hparams=hparams, config_diff=config_diff(hparams)), indent=2, sort_keys=True))
+    sys.exit(0)
+
+import torch
+from torch import Tensor, nn
+from torch.optim import AdamW
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+########################################
+#              Dataloader              #
+########################################
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % dist.get_world_size() == 0
+    local_batch_size = batch_size // dist.get_world_size()
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        pos += batch_size
+        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
+
+
+########################################
+#             Architecture             #
+########################################
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        # half-truncate RoPE (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        self.register_buffer("angular_freq", torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
+
+    def forward(self, x_BTHD: Tensor):
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
+        theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
+        cos, sin = theta.cos(), theta.sin()
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim=128):
+        super().__init__()
+        self.num_heads = dim // head_dim
+        self.head_dim = head_dim
+        hdim = self.num_heads * self.head_dim
+        self.q = Linear(dim, hdim)
+        self.k = Linear(dim, hdim)
+        self.v = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+        self.rotary = Rotary(head_dim)
+
+    def forward(self, x: Tensor):
+        B, T = x.size(0), x.size(1)
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        q, k = self.rotary(q), self.rotary(k)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                           v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        y = self.proj(y)
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.fc = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+
+    def forward(self, x: Tensor):
+        x = self.fc(x)
+        x = x.relu().square()
+        x = self.proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim)
+        self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+    def forward(self, x: Tensor):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
+        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
+        self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
+
+    def forward(self, inputs: Tensor, targets: Tensor):
+        x = self.norm1(self.embed(inputs))
+        for block in self.blocks:
+            x = block(x)
+        logits = self.proj(self.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+
+
+########################################
+#              Optimizer               #
+########################################
+
+def leon_compute_dtype(dtype_name: str):
+    if dtype_name == "bfloat16":
+        return torch.bfloat16
+    if dtype_name == "float32":
+        return torch.float32
+    if dtype_name == "float64":
+        return torch.float64
+    raise ValueError(f"Unsupported Leon orthogonalization dtype: {dtype_name!r}")
+
+
+def leon_accum_dtype(dtype_name: str):
+    return torch.float64 if dtype_name == "float64" else torch.float32
+
+
+def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_buffer: Tensor,
+                       momentum: float = 0.95, beta2: float = 0.7,
+                       ns_iters: int = 6, ns_coeffs: tuple = (2, -1.5, 0.5),
+                       eps: float = 1e-7, l_scale: float = 1.0,
+                       compute_dtype: str = "bfloat16",
+                       l_normalize_mode: str = "off",
+                       match_l0_norm: bool = False) -> Tensor:
+    """
+    Leon update: Nesterov momentum + Newton-Schulz orthogonalization with
+    augmented Gram matrix (second momentum buffer).
+
+    Computes (GG^T + L)^{-0.5} G where L is an EMA-like gradient Gram statistic,
+    using Newton-Schulz iterations to approximate the matrix inverse square root.
+
+    Args:
+        grad: Raw gradient (mutated in-place into the Nesterov-corrected update)
+        momentum_buffer: First-moment unnormalized exponential sum
+            S_t = momentum * S_{t-1} + grad_t (updated in place).
+        second_momentum_buffer: Second-moment unnormalized exponential sum
+            T_t = beta2 * T_{t-1} + grad_t grad_t^T (updated in place).
+        momentum: First momentum coefficient (Nesterov)
+        beta2: Second momentum coefficient
+        ns_iters: Number of Newton-Schulz iterations
+        ns_coeffs: (a, b, c) coefficients for the NS iteration
+        eps: Diagonal stability epsilon added to the augmented Gram matrix
+        l_scale: Multiplier for the second-momentum Gram contribution
+        compute_dtype: Matrix-update dtype for X inside the NS iteration
+        l_normalize_mode: "off" uses L = l_scale * T_t; "match_g" rescales L so
+            tr(L) = l_scale * ||G||_F^2 (l_scale=1.0 -> tr(L) fraction 0.5).
+        match_l0_norm: When True, rescale the final NS output to Frobenius norm
+            sqrt(min(D1, D2)), matching the L=0 update's natural Frobenius norm.
+    """
+    is_tall = grad.size(-2) >= grad.size(-1)
+    x_dtype = leon_compute_dtype(compute_dtype)
+    accum_dtype = leon_accum_dtype(compute_dtype)
+
+    # 0. Compute Gram matrix of raw gradient BEFORE mutating it with momentum
+    if is_tall:
+        gram_tmp = grad.mT @ grad
+    else:
+        gram_tmp = grad @ grad.mT
+
+    # Both buffers are stored as unnormalized exponential sums:
+    #   S_t = momentum * S_{t-1} + grad_t          (first moment)
+    #   T_t = beta2    * T_{t-1} + grad_t grad_t^T (second moment)
+    # so we avoid the lerp_ / divide-by-(1-decay) round-trip used in EMA storage.
+
+    # 1. First-moment sum + Nesterov: g = grad + momentum * S_t
+    momentum_buffer.mul_(momentum).add_(grad)
+    g = grad.add_(momentum_buffer, alpha=momentum)
+
+    # 2. Second-moment sum: T_t in place
+    second_momentum_buffer.mul_(beta2).add_(gram_tmp)
+
+    X = g.to(dtype=x_dtype)
+    L_unscaled = second_momentum_buffer.to(dtype=accum_dtype)
+    if l_normalize_mode == "match_g":
+        x_sq = X.to(dtype=accum_dtype).pow(2).sum()
+        raw_l_tr = L_unscaled.diagonal(dim1=-2, dim2=-1).sum().clamp_min(1e-12)
+        # Rescale so tr(L) = l_scale * ||X||_F^2 regardless of the raw sum magnitude.
+        L = L_unscaled * (l_scale * x_sq / raw_l_tr)
+    else:
+        L = L_unscaled * l_scale
+    A = 0.5 * (L + L.transpose(-2, -1))  # ensure symmetry
+
+    # 3. Scale so that tr(GG^T + L) ≈ 1
+    tr = X.to(dtype=accum_dtype).pow(2).sum(dim=(-2, -1), keepdim=True) \
+       + A.diagonal(dim1=-2, dim2=-1).sum(dim=-1, keepdim=True).unsqueeze(-1)
+    tr = tr.clamp_min(1e-12) * ((1 + 2e-2)**2)  # safety cushion
+
+    inv_sqrt_tr = tr.rsqrt()
+    inv_tr = inv_sqrt_tr.square()
+
+    X = X * inv_sqrt_tr.to(X.dtype)
+    A = (A * inv_tr).contiguous()
+
+    # 4. Initial augmented Gram: A0 = gram(X) + L_scaled
+    if is_tall:
+        A = A + (X.mT @ X)
+    else:
+        A = A + (X @ X.mT)
+    A.diagonal(dim1=-2, dim2=-1).add_(eps)  # eps for stability
+
+    # 5. Newton-Schulz iterations with A iteration
+    a, b, c = ns_coeffs
+    last_iter = ns_iters - 1
+    for i in range(ns_iters):
+        A = 0.5 * (A + A.transpose(-2, -1))  # keep symmetric
+        B = b * A + c * (A @ A)
+
+        if is_tall:
+            X = a * X + X @ B.to(X.dtype)
+        else:
+            X = a * X + B.to(X.dtype) @ X
+
+        # Update A alongside X (skip on last iteration)
+        if i < last_iter:
+            # A <- (aI + B) A (aI + B)
+            # computed as: D = a*A + B@A, then A = a*D + D@B
+            D = a * A + B @ A
+            A = a * D + D @ B
+
+    if match_l0_norm:
+        # Rescale X to ||X||_F = sqrt(min(D1, D2)), the natural Frobenius norm
+        # of an orthogonalized (L=0) Muon-NS update.
+        target = float(min(X.size(-2), X.size(-1))) ** 0.5
+        cur = X.to(dtype=accum_dtype).norm().clamp_min(1e-12)
+        X = X * (target / cur).to(X.dtype)
+
+    return X
+
+
+class Leon(torch.optim.Optimizer):
+    """
+    Leon optimizer: Nesterov momentum + Newton-Schulz orthogonalization with
+    an augmented Gram matrix (second momentum buffer).
+
+    Unlike Muon which recomputes A = X@X^T each NS iteration, Leon maintains
+    a second momentum buffer L (scaled from an EMA of gradient Gram matrices) and augments
+    the iteration matrix: A = X@X^T + L. A is also iterated alongside X.
+    """
+    def __init__(self, params, lr=0.025, weight_decay=0.025, mu=0.95, beta2=0.7,
+                 ns_iters=6, eps=1e-7, l_scale=1.0, orthogonalize_dtype="bfloat16",
+                 l_normalize_mode="off", match_l0_norm=False):
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, beta2=beta2,
+                        ns_iters=ns_iters, eps=eps, l_scale=l_scale,
+                        orthogonalize_dtype=orthogonalize_dtype,
+                        l_normalize_mode=l_normalize_mode,
+                        match_l0_norm=match_l0_norm)
+        super().__init__(params, defaults)
+        self.param_names = {}
+
+    def diagnostic_stats(self, selected_patterns):
+        if isinstance(selected_patterns, str):
+            selected_patterns = (selected_patterns,)
+        selected_patterns = tuple(selected_patterns)
+
+        rows = []
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        with torch.no_grad():
+            for group in self.param_groups:
+                params = group["params"]
+                for base_i in range(0, len(params), world_size):
+                    if base_i + rank >= len(params):
+                        continue
+                    p = params[base_i + rank]
+                    name = self.param_names.get(p, f"param_{base_i + rank}")
+                    if selected_patterns and not any(pattern in name for pattern in selected_patterns):
+                        continue
+                    if p.grad is None:
+                        continue
+
+                    state = self.state[p]
+                    if len(state) == 0:
+                        momentum_buffer = torch.zeros_like(p, dtype=torch.float32)
+                        min_D = min(p.shape[-2], p.shape[-1])
+                        second_momentum_buffer = torch.zeros(
+                            min_D, min_D, dtype=torch.float32, device=p.device
+                        )
+                    else:
+                        momentum_buffer = state["momentum_buffer"]
+                        second_momentum_buffer = state["second_momentum_buffer"]
+
+                    grad = p.grad.float()
+                    momentum_clone = momentum_buffer.clone()
+                    l_clone = second_momentum_buffer.clone()
+                    grad_for_update = grad.clone()
+                    update = leon_orthogonalize(
+                        grad_for_update, momentum_clone, l_clone,
+                        momentum=group["mu"], beta2=group["beta2"],
+                        ns_iters=group["ns_iters"], eps=group["eps"],
+                        l_scale=group["l_scale"],
+                        compute_dtype=group["orthogonalize_dtype"],
+                        l_normalize_mode=group["l_normalize_mode"],
+                        match_l0_norm=group["match_l0_norm"],
+                    )
+                    update *= max(1, p.size(-2) / p.size(-1))**0.5
+
+                    momentum_l0 = momentum_buffer.clone()
+                    l_l0 = second_momentum_buffer.clone()
+                    update_l0 = leon_orthogonalize(
+                        grad.clone(), momentum_l0, l_l0,
+                        momentum=group["mu"], beta2=group["beta2"],
+                        ns_iters=group["ns_iters"], eps=group["eps"],
+                        l_scale=0.0,
+                        compute_dtype=group["orthogonalize_dtype"],
+                    )
+                    update_l0 *= max(1, p.size(-2) / p.size(-1))**0.5
+
+                    update_float = update.float()
+                    update_l0_float = update_l0.float()
+                    update_norm = update_float.norm()
+                    update_l0_norm = update_l0_float.norm()
+                    cosine_denom = (update_norm * update_l0_norm).clamp_min(1e-12)
+                    update_l0_cos = (update_float.flatten() @ update_l0_float.flatten()) / cosine_denom
+                    grad_norm = grad.norm()
+                    # momentum_clone / l_clone are post-`leon_orthogonalize`, so they already
+                    # hold the unnormalized exponential sums S_t and T_t. No 1/(1-decay) factor.
+                    momentum_for_stats = momentum_clone
+                    l_for_stats = l_clone
+                    momentum_norm = momentum_for_stats.norm()
+                    update_grad_cos = (update_float.flatten() @ grad.flatten()) / (
+                        update_norm * grad_norm
+                    ).clamp_min(1e-12)
+                    update_momentum_cos = (update_float.flatten() @ momentum_for_stats.flatten()) / (
+                        update_norm * momentum_norm
+                    ).clamp_min(1e-12)
+
+                    l_sym = 0.5 * (l_for_stats + l_for_stats.transpose(-2, -1))
+                    l_trace = l_sym.diagonal(dim1=-2, dim2=-1).sum().clamp_min(0)
+                    l_fro = l_sym.norm()
+                    diagnostic_accum_dtype = leon_accum_dtype(group["orthogonalize_dtype"])
+                    g_sq = grad_for_update.to(dtype=diagnostic_accum_dtype).pow(2).sum()
+                    # Reflect the actual effective tr(L) used inside leon_orthogonalize:
+                    # match_g rescales tr(L) to l_scale * ||g||^2, off uses l_scale * tr(L_unscaled).
+                    if group["l_normalize_mode"] == "match_g":
+                        effective_l_trace = group["l_scale"] * g_sq
+                    else:
+                        effective_l_trace = group["l_scale"] * l_trace
+                    l_trace_fraction = effective_l_trace / (g_sq + effective_l_trace).clamp_min(1e-12)
+                    if l_trace > 0:
+                        l_top_eval = torch.linalg.eigvalsh(l_sym).amax().clamp_min(0)
+                        l_top_eval_fraction = l_top_eval / l_trace.clamp_min(1e-12)
+                    else:
+                        l_top_eval = l_trace
+                        l_top_eval_fraction = l_trace
+
+                    weight_norm = p.float().norm()
+                    # LR-free shape metric: ||update||_F / ||W||_F. Multiply by lr (also
+                    # logged) to recover the per-step relative move.
+                    relative_update = update_norm / weight_norm.clamp_min(1e-12)
+                    relative_update_l0 = update_l0_norm / weight_norm.clamp_min(1e-12)
+
+                    rows.append(dict(
+                        name=name,
+                        lr=float(group["lr"]),
+                        weight_norm=float(weight_norm.item()),
+                        grad_norm=float(grad_norm.item()),
+                        momentum_norm=float(momentum_norm.item()),
+                        update_norm=float(update_norm.item()),
+                        update_l0_norm=float(update_l0_norm.item()),
+                        relative_update=float(relative_update.item()),
+                        relative_update_l0=float(relative_update_l0.item()),
+                        update_l0_cos=float(update_l0_cos.item()),
+                        update_grad_cos=float(update_grad_cos.item()),
+                        update_momentum_cos=float(update_momentum_cos.item()),
+                        l_trace=float(l_trace.item()),
+                        l_fro=float(l_fro.item()),
+                        l_trace_fraction=float(l_trace_fraction.item()),
+                        l_top_eval=float(l_top_eval.item()),
+                        l_top_eval_fraction=float(l_top_eval_fraction.item()),
+                    ))
+        return rows
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
+                        D1, D2 = p.shape[-2], p.shape[-1]
+                        min_D = min(D1, D2)
+                        state["second_momentum_buffer"] = torch.zeros(
+                            min_D, min_D, dtype=torch.float32, device=p.device
+                        )
+                    grad = p.grad.float()
+                    update = leon_orthogonalize(
+                        grad, state["momentum_buffer"], state["second_momentum_buffer"],
+                        momentum=group["mu"], beta2=group["beta2"],
+                        ns_iters=group["ns_iters"], eps=group["eps"],
+                        l_scale=group["l_scale"],
+                        compute_dtype=group["orthogonalize_dtype"],
+                        l_normalize_mode=group["l_normalize_mode"],
+                        match_l0_norm=group["match_l0_norm"],
+                    )
+                    update *= max(1, p.size(-2) / p.size(-1))**0.5
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+
+########################################
+#                Setup                 #
+########################################
+
+def main():
+    args = parse_args()
+    num_trials = args.trials if args.trials is not None else (args.legacy_trials or 1)
+    hparams = resolve_hparams(args.set)
+    validate_hparams(hparams)
+
+    if args.dry_run:
+        run_dir = create_run_dir(args.out_dir)
+        write_run_files(run_dir, args, hparams, "dry-run")
+        print(f"dry_run:true out_dir:{run_dir}")
+        print(json.dumps(dict(hparams=hparams, config_diff=config_diff(hparams)), indent=2, sort_keys=True))
+        return
+
+    global device
+    # torchrun sets these env variables
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    dist.barrier()
+    # this code can be run equivalently with 1, 2, 4, or 8 gpus.
+    assert 8 % dist.get_world_size() == 0
+
+    try:
+        if dist.get_rank() == 0:
+            run_dir = create_run_dir(args.out_dir)
+        else:
+            run_dir = None
+        run_dir_obj = [str(run_dir) if run_dir is not None else None]
+        dist.broadcast_object_list(run_dir_obj, src=0)
+        run_dir = Path(run_dir_obj[0])
+        logfile = run_dir / "train.log"
+
+        # logging setup
+        if dist.get_rank() == 0:
+            print(logfile)
+            write_run_files(run_dir, args, hparams, "train", dict(
+                device_name=torch.cuda.get_device_name(device),
+                world_size=dist.get_world_size(),
+            ))
+
+        wandb_run = None
+        if hparams["wandb_project"] is not None and dist.get_rank() == 0:
+            try:
+                import wandb
+                wandb_run = wandb.init(
+                    project=hparams["wandb_project"],
+                    mode=hparams.get("wandb_mode", "online"),
+                    name=hparams.get("wandb_run_name") or run_dir.name,
+                    dir=str(run_dir),
+                    config=hparams,
+                    tags=[Path(__file__).stem, f"world_size={dist.get_world_size()}"],
+                )
+            except Exception as e:
+                print(f"[wandb] init failed, continuing without wandb: {e}")
+                wandb_run = None
+
+        def print0(s, console=False, log=True):
+            if dist.get_rank() == 0:
+                if console:
+                    print(s)
+                if log:
+                    with open(logfile, "a") as f:
+                        print(s, file=f)
+
+        # we begin by logging this file itself
+        print0(code)
+        print0("="*100)
+        print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+               + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
+        print0(json.dumps(dict(hparams=hparams, config_diff=config_diff(hparams)), indent=2, sort_keys=True))
+        print0("="*100)
+
+        val_tokens = 20 * 524288
+        batch_size = 8 * 64 * 1024
+        mbs = 64
+        val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+
+        model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
+        model.compile(dynamic=False)
+
+        for _ in range(num_trials):
+
+
+            ########################################
+            #            Hyperparameters            #
+            ########################################
+
+            train_steps = hparams["train_steps"]
+
+            # initialize model parameters
+            for name, p in model.named_parameters():
+                w = p.data
+                if name.endswith("weight"):
+                    if "proj" in name:
+                        w.zero_()
+                    elif "embed" in name:
+                        w.normal_()  # default torch init
+                    else:
+                        w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+                elif name.endswith("bias"):
+                    w.zero_()
+                elif name.endswith("gains"):
+                    w.normal_(mean=1, std=0)
+                else:
+                    raise Exception(f"Uninitialized parameter: {name}")
+
+            # create the optimizer(s)
+            optimizer1 = AdamW([dict(params=[model.embed.weight], lr=hparams["embed_lr"]),
+                                dict(params=[model.proj.weight], lr=hparams["proj_lr"]),
+                                dict(params=[p for p in model.parameters() if p.ndim < 2], lr=hparams["scalar_lr"])],
+                               betas=hparams["adam_betas"], eps=hparams["adam_eps"],
+                               weight_decay=hparams["adam_wd"], fused=True)
+            optimizer2 = Leon([p for p in model.blocks.parameters() if p.ndim >= 2],
+                              lr=hparams["leon_lr"], weight_decay=hparams["leon_wd"],
+                              mu=hparams["leon_mu"], beta2=hparams["leon_beta2"],
+                              ns_iters=hparams["leon_ns_iters"], eps=hparams["leon_eps"],
+                              l_scale=hparams["leon_l_scale"],
+                              orthogonalize_dtype=hparams["leon_orthogonalize_dtype"],
+                              l_normalize_mode=hparams["leon_l_normalize_mode"],
+                              match_l0_norm=hparams["leon_match_l0_norm"])
+            optimizer2.param_names = {p: name for name, p in model.named_parameters()}
+            optimizers = [optimizer1, optimizer2]
+            assert set(p for opt in optimizers for group in opt.param_groups
+                       for p in group["params"]) == set(model.parameters())
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["initial_lr"] = group["lr"]
+            for group in optimizer1.param_groups:
+                group["cooldown_frac"] = hparams["adam_cooldown_frac"]
+            for group in optimizer2.param_groups:
+                group["cooldown_frac"] = hparams["leon_cooldown_frac"]
+                group["l_scale"] = scheduled_l_scale(hparams, 0.0)
+
+            # learning rate schedule: stable then decay
+            def set_hparams(step):
+                progress = step / train_steps
+                assert 0 <= progress < 1
+                for opt in optimizers:
+                    for group in opt.param_groups:
+                        cooldown_frac = group["cooldown_frac"]
+                        if progress < 1 - cooldown_frac:
+                            eta = 1.0
+                        else:
+                            eta = (1 - progress) / cooldown_frac
+                        group["lr"] = group["initial_lr"] * eta
+                l_scale = scheduled_l_scale(hparams, progress)
+                for group in optimizer2.param_groups:
+                    group["l_scale"] = l_scale
+
+            def log_leon_diagnostics(step):
+                if not hparams["leon_log_diagnostics"]:
+                    return
+                interval = hparams["leon_diag_interval"]
+                if interval <= 0 or step % interval != 0:
+                    return
+                local_rows = optimizer2.diagnostic_stats(hparams["leon_diag_patterns"])
+                gathered_rows = [None] * dist.get_world_size()
+                dist.all_gather_object(gathered_rows, local_rows)
+                if dist.get_rank() != 0:
+                    return
+                rows = [row for rank_rows in gathered_rows for row in rank_rows]
+                rows.sort(key=lambda row: row["name"])
+                for row in rows:
+                    print0(
+                        "diag"
+                        + f" step:{step}"
+                        + f" name:{row['name']}"
+                        + f" lr:{row['lr']:.8g}"
+                        + f" weight_norm:{row['weight_norm']:.6g}"
+                        + f" grad_norm:{row['grad_norm']:.6g}"
+                        + f" momentum_norm:{row['momentum_norm']:.6g}"
+                        + f" update_norm:{row['update_norm']:.6g}"
+                        + f" update_l0_norm:{row['update_l0_norm']:.6g}"
+                        + f" relative_update:{row['relative_update']:.6g}"
+                        + f" relative_update_l0:{row['relative_update_l0']:.6g}"
+                        + f" update_l0_cos:{row['update_l0_cos']:.6g}"
+                        + f" update_grad_cos:{row['update_grad_cos']:.6g}"
+                        + f" update_momentum_cos:{row['update_momentum_cos']:.6g}"
+                        + f" l_trace:{row['l_trace']:.6g}"
+                        + f" l_fro:{row['l_fro']:.6g}"
+                        + f" l_trace_fraction:{row['l_trace_fraction']:.6g}"
+                        + f" l_top_eval:{row['l_top_eval']:.6g}"
+                        + f" l_top_eval_fraction:{row['l_top_eval_fraction']:.6g}",
+                        console=False,
+                    )
+                if wandb_run is not None:
+                    wandb_run.log({
+                        f"diag/{row['name']}/{k}": v
+                        for row in rows for k, v in row.items() if k != "name"
+                    }, step=step)
+
+
+            ########################################
+            #        Training and Validation       #
+            ########################################
+
+            train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+            for p in model.parameters():
+                dist.broadcast(p.detach(), 0)
+            # start the clock
+            training_time = 0
+            last_val_step = 0
+            dist.barrier()
+            t0 = time.perf_counter()
+            for step in range(train_steps + 1):
+
+                # --------------- VALIDATION SECTION -----------------
+                if step == train_steps or step % 125 == 0:
+                    # stop the clock
+                    dist.barrier()
+                    time_since_last_val = time.perf_counter() - t0
+                    step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
+                    last_val_step = step
+                    training_time += time_since_last_val
+                    model.eval()
+                    val_loss = 0
+                    with torch.no_grad():
+                        assert len(val_inputs) % mbs == 0
+                        for i in range(len(val_inputs) // mbs):
+                            val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+                    dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+                    val_loss /= val_tokens
+                    print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+                           + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+                    if wandb_run is not None:
+                        wandb_run.log({
+                            "val_loss": float(val_loss),
+                            "train_time_s": training_time,
+                            "step_avg_ms": 1000 * step_avg if step > 0 else 0.0,
+                        }, step=step)
+                    model.train()
+                    # start the clock again
+                    dist.barrier()
+                    t0 = time.perf_counter()
+
+                if step == train_steps:
+                    break
+
+                # --------------- TRAINING SECTION -----------------
+                inputs, targets = next(train_loader)
+                # accumulate across microbatches in case we are running with fewer than 8 gpus
+                assert len(inputs) % mbs == 0
+                for i in range(len(inputs) // mbs):
+                    model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+                for name, p in model.named_parameters():
+                    assert p.grad is not None, name
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                # set optimization hyperparameters and take a step
+                set_hparams(step)
+                log_leon_diagnostics(step + 1)
+                for opt in optimizers:
+                    opt.step()
+                model.zero_grad(set_to_none=True)
+                approx_training_time = training_time + (time.perf_counter() - t0)
+                print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+                       + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+    finally:
+        if 'wandb_run' in locals() and wandb_run is not None:
+            wandb_run.finish()
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+Running PyTorch 2.11.0+cu128 compiled for CUDA 12.8 on NVIDIA H100 NVL with world_size 4
+{
+  "config_diff": {
+    "leon_eps": 1e-12,
+    "leon_l_normalize_mode": "match_g",
+    "leon_log_diagnostics": true,
+    "leon_ns_iters": 12,
+    "leon_orthogonalize_dtype": "float32",
+    "train_steps": 1500,
+    "wandb_project": "modded-nanogpt-track3",
+    "wandb_run_name": "leon_matchg_1500_diag"
+  },
+  "hparams": {
+    "adam_betas": [
+      0.8,
+      0.95
+    ],
+    "adam_cooldown_frac": 0.7,
+    "adam_eps": 1e-10,
+    "adam_wd": 0.0,
+    "embed_lr": 0.3,
+    "leon_beta2": 0.7,
+    "leon_cooldown_frac": 0.7,
+    "leon_diag_interval": 125,
+    "leon_diag_patterns": [
+      "blocks.0.attn.q.weight",
+      "blocks.6.mlp.proj.weight",
+      "blocks.11.attn.proj.weight"
+    ],
+    "leon_eps": 1e-12,
+    "leon_l_normalize_mode": "match_g",
+    "leon_l_scale": 1.0,
+    "leon_l_scale_ramp_end_frac": 0.6,
+    "leon_l_scale_ramp_start_frac": 0.2,
+    "leon_l_scale_schedule": "constant",
+    "leon_log_diagnostics": true,
+    "leon_lr": 0.025,
+    "leon_match_l0_norm": false,
+    "leon_mu": 0.95,
+    "leon_ns_iters": 12,
+    "leon_orthogonalize_dtype": "float32",
+    "leon_wd": 0.025,
+    "proj_lr": 0.003125,
+    "scalar_lr": 0.01,
+    "train_steps": 1500,
+    "wandb_mode": "online",
+    "wandb_project": "modded-nanogpt-track3",
+    "wandb_run_name": "leon_matchg_1500_diag"
+  }
+}
+====================================================================================================
+step:0/1500 val_loss:10.82584 train_time:0.000s step_avg:nanms
+diag step:125 name:blocks.0.attn.q.weight lr:0.025 weight_norm:25.2404 grad_norm:6275.76 momentum_norm:10160.4 update_norm:19.5642 update_l0_norm:27.4472 relative_update:0.775115 relative_update_l0:1.08743 update_l0_cos:0.904235 update_grad_cos:0.204628 update_momentum_cos:0.540195 l_trace:1.40401e+08 l_fro:8.00138e+07 l_trace_fraction:0.5 l_top_eval:7.82053e+07 l_top_eval_fraction:0.557015
+diag step:125 name:blocks.11.attn.proj.weight lr:0.025 weight_norm:27.5995 grad_norm:11222.9 momentum_norm:13091 update_norm:18.7818 update_l0_norm:26.1805 relative_update:0.680513 relative_update_l0:0.948588 update_l0_cos:0.886323 update_grad_cos:0.0829986 update_momentum_cos:0.316066 l_trace:2.92202e+08 l_fro:2.57595e+08 l_trace_fraction:0.5 l_top_eval:2.57366e+08 l_top_eval_fraction:0.880784
+diag step:125 name:blocks.6.mlp.proj.weight lr:0.025 weight_norm:32.5473 grad_norm:12492.1 momentum_norm:12732.2 update_norm:21.4408 update_l0_norm:27.7128 relative_update:0.658757 relative_update_l0:0.851463 update_l0_cos:0.966597 update_grad_cos:0.181931 update_momentum_cos:0.618312 l_trace:4.16249e+08 l_fro:2.06614e+08 l_trace_fraction:0.5 l_top_eval:1.88342e+08 l_top_eval_fraction:0.452476
+step:125/1500 val_loss:4.57564 train_time:60.239s step_avg:481.90ms
+diag step:250 name:blocks.0.attn.q.weight lr:0.025 weight_norm:35.8815 grad_norm:2911.83 momentum_norm:5950.7 update_norm:18.9009 update_l0_norm:27.5333 relative_update:0.526759 relative_update_l0:0.767339 update_l0_cos:0.896163 update_grad_cos:0.298836 update_momentum_cos:0.642518 l_trace:3.36288e+07 l_fro:1.18845e+07 l_trace_fraction:0.5 l_top_eval:9.84367e+06 l_top_eval_fraction:0.292715
+diag step:250 name:blocks.11.attn.proj.weight lr:0.025 weight_norm:43.0319 grad_norm:5999.84 momentum_norm:6081.67 update_norm:20.7297 update_l0_norm:27.1248 relative_update:0.481728 relative_update_l0:0.630343 update_l0_cos:0.917331 update_grad_cos:0.11103 update_momentum_cos:0.481015 l_trace:1.19844e+08 l_fro:1.07695e+08 l_trace_fraction:0.5 l_top_eval:1.07671e+08 l_top_eval_fraction:0.898425
+diag step:250 name:blocks.6.mlp.proj.weight lr:0.025 weight_norm:44.7725 grad_norm:7456.98 momentum_norm:10291.3 update_norm:21.4846 update_l0_norm:27.7128 relative_update:0.479861 relative_update_l0:0.618969 update_l0_cos:0.976524 update_grad_cos:0.27914 update_momentum_cos:0.768184 l_trace:1.82157e+08 l_fro:7.28288e+07 l_trace_fraction:0.5 l_top_eval:6.60193e+07 l_top_eval_fraction:0.36243
+step:250/1500 val_loss:4.08884 train_time:117.947s step_avg:461.67ms
+diag step:375 name:blocks.0.attn.q.weight lr:0.025 weight_norm:42.1259 grad_norm:2666.75 momentum_norm:5060.96 update_norm:18.8749 update_l0_norm:27.5286 relative_update:0.448059 relative_update_l0:0.653484 update_l0_cos:0.895392 update_grad_cos:0.270233 update_momentum_cos:0.670488 l_trace:2.4573e+07 l_fro:9.12189e+06 l_trace_fraction:0.5 l_top_eval:8.0962e+06 l_top_eval_fraction:0.329476
+diag step:375 name:blocks.11.attn.proj.weight lr:0.025 weight_norm:53.3061 grad_norm:4263.49 momentum_norm:4966.6 update_norm:21.2875 update_l0_norm:27.2955 relative_update:0.399345 relative_update_l0:0.512052 update_l0_cos:0.92635 update_grad_cos:0.134103 update_momentum_cos:0.534845 l_trace:7.91026e+07 l_fro:7.10645e+07 l_trace_fraction:0.5 l_top_eval:7.10537e+07 l_top_eval_fraction:0.898247
+diag step:375 name:blocks.6.mlp.proj.weight lr:0.025 weight_norm:52.3173 grad_norm:6465.38 momentum_norm:10204.8 update_norm:21.2052 update_l0_norm:27.7128 relative_update:0.405319 relative_update_l0:0.529707 update_l0_cos:0.978894 update_grad_cos:0.32537 update_momentum_cos:0.810465 l_trace:1.33761e+08 l_fro:4.54029e+07 l_trace_fraction:0.5 l_top_eval:4.00789e+07 l_top_eval_fraction:0.299632
+step:375/1500 val_loss:3.91419 train_time:175.492s step_avg:460.36ms
+diag step:500 name:blocks.0.attn.q.weight lr:0.023833333 weight_norm:46.6969 grad_norm:2157.49 momentum_norm:4582.92 update_norm:18.3127 update_l0_norm:27.5362 relative_update:0.39216 relative_update_l0:0.58968 update_l0_cos:0.888519 update_grad_cos:0.311898 update_momentum_cos:0.68871 l_trace:1.63256e+07 l_fro:4.68525e+06 l_trace_fraction:0.5 l_top_eval:3.62334e+06 l_top_eval_fraction:0.221942
+diag step:500 name:blocks.11.attn.proj.weight lr:0.023833333 weight_norm:60.8936 grad_norm:5268.38 momentum_norm:4532.58 update_norm:21.0319 update_l0_norm:27.2796 relative_update:0.345388 relative_update_l0:0.447988 update_l0_cos:0.926263 update_grad_cos:0.115669 update_momentum_cos:0.554735 l_trace:8.17637e+07 l_fro:7.44972e+07 l_trace_fraction:0.5 l_top_eval:7.44896e+07 l_top_eval_fraction:0.911036
+diag step:500 name:blocks.6.mlp.proj.weight lr:0.023833333 weight_norm:57.6289 grad_norm:6155.34 momentum_norm:10002.6 update_norm:21.2589 update_l0_norm:27.7128 relative_update:0.368893 relative_update_l0:0.480884 update_l0_cos:0.980563 update_grad_cos:0.328608 update_momentum_cos:0.835091 l_trace:1.21923e+08 l_fro:4.28906e+07 l_trace_fraction:0.5 l_top_eval:4.06434e+07 l_top_eval_fraction:0.333352
+step:500/1500 val_loss:3.80913 train_time:233.056s step_avg:460.51ms
+diag step:625 name:blocks.0.attn.q.weight lr:0.020857143 weight_norm:49.3337 grad_norm:2063.22 momentum_norm:4245.18 update_norm:18.3797 update_l0_norm:27.5605 relative_update:0.372558 relative_update_l0:0.558654 update_l0_cos:0.887698 update_grad_cos:0.311832 update_momentum_cos:0.705107 l_trace:1.45023e+07 l_fro:4.60984e+06 l_trace_fraction:0.5 l_top_eval:4.0868e+06 l_top_eval_fraction:0.281805
+diag step:625 name:blocks.11.attn.proj.weight lr:0.020857143 weight_norm:65.5896 grad_norm:3736.6 momentum_norm:4273.57 update_norm:20.7995 update_l0_norm:27.3923 relative_update:0.317115 relative_update_l0:0.417632 update_l0_cos:0.922991 update_grad_cos:0.158118 update_momentum_cos:0.586894 l_trace:4.88894e+07 l_fro:4.2425e+07 l_trace_fraction:0.5 l_top_eval:4.24167e+07 l_top_eval_fraction:0.867606
+diag step:625 name:blocks.6.mlp.proj.weight lr:0.020857143 weight_norm:60.6106 grad_norm:5354.07 momentum_norm:10169.2 update_norm:20.9699 update_l0_norm:27.7128 relative_update:0.345978 relative_update_l0:0.457227 update_l0_cos:0.981173 update_grad_cos:0.383281 update_momentum_cos:0.846056 l_trace:1.01156e+08 l_fro:2.86429e+07 l_trace_fraction:0.5 l_top_eval:2.57637e+07 l_top_eval_fraction:0.254693
+step:625/1500 val_loss:3.72579 train_time:290.621s step_avg:460.52ms
+diag step:750 name:blocks.0.attn.q.weight lr:0.017880952 weight_norm:50.7268 grad_norm:1636.79 momentum_norm:4196.37 update_norm:17.6286 update_l0_norm:27.5555 relative_update:0.347521 relative_update_l0:0.543214 update_l0_cos:0.879034 update_grad_cos:0.34438 update_momentum_cos:0.72206 l_trace:9.75185e+06 l_fro:2.00389e+06 l_trace_fraction:0.5 l_top_eval:1.60992e+06 l_top_eval_fraction:0.165089
+diag step:750 name:blocks.11.attn.proj.weight lr:0.017880952 weight_norm:68.2488 grad_norm:3187.74 momentum_norm:4368.29 update_norm:21.1209 update_l0_norm:27.431 relative_update:0.309469 relative_update_l0:0.401926 update_l0_cos:0.927337 update_grad_cos:0.171101 update_momentum_cos:0.599223 l_trace:4.6258e+07 l_fro:3.99311e+07 l_trace_fraction:0.5 l_top_eval:3.99226e+07 l_top_eval_fraction:0.863042
+diag step:750 name:blocks.6.mlp.proj.weight lr:0.017880952 weight_norm:61.9591 grad_norm:5265.05 momentum_norm:10762.3 update_norm:20.5373 update_l0_norm:27.7128 relative_update:0.331466 relative_update_l0:0.447276 update_l0_cos:0.980455 update_grad_cos:0.385539 update_momentum_cos:0.855241 l_trace:9.20061e+07 l_fro:2.23411e+07 l_trace_fraction:0.5 l_top_eval:2.00685e+07 l_top_eval_fraction:0.218122
+step:750/1500 val_loss:3.66112 train_time:348.160s step_avg:460.32ms
+diag step:875 name:blocks.0.attn.q.weight lr:0.014904762 weight_norm:51.229 grad_norm:1961.06 momentum_norm:4369.71 update_norm:17.5541 update_l0_norm:27.5591 relative_update:0.342659 relative_update_l0:0.537959 update_l0_cos:0.877988 update_grad_cos:0.311768 update_momentum_cos:0.706894 l_trace:1.1102e+07 l_fro:2.75881e+06 l_trace_fraction:0.5 l_top_eval:2.11672e+06 l_top_eval_fraction:0.190661
+diag step:875 name:blocks.11.attn.proj.weight lr:0.014904762 weight_norm:69.6156 grad_norm:3122.46 momentum_norm:4354.99 update_norm:20.0245 update_l0_norm:27.459 relative_update:0.287644 relative_update_l0:0.394438 update_l0_cos:0.914673 update_grad_cos:0.184827 update_momentum_cos:0.625249 l_trace:2.94292e+07 l_fro:2.29704e+07 l_trace_fraction:0.5 l_top_eval:2.29562e+07 l_top_eval_fraction:0.780051
+diag step:875 name:blocks.6.mlp.proj.weight lr:0.014904762 weight_norm:62.3285 grad_norm:5054.5 momentum_norm:11058.5 update_norm:20.2658 update_l0_norm:27.7128 relative_update:0.325146 relative_update_l0:0.444625 update_l0_cos:0.980184 update_grad_cos:0.393356 update_momentum_cos:0.864484 l_trace:8.52623e+07 l_fro:1.76346e+07 l_trace_fraction:0.5 l_top_eval:1.60288e+07 l_top_eval_fraction:0.187994
+step:875/1500 val_loss:3.60645 train_time:405.723s step_avg:460.50ms
+diag step:1000 name:blocks.0.attn.q.weight lr:0.011928571 weight_norm:51.2019 grad_norm:1809.07 momentum_norm:4448.03 update_norm:17.298 update_l0_norm:27.5452 relative_update:0.337839 relative_update_l0:0.537972 update_l0_cos:0.87623 update_grad_cos:0.339844 update_momentum_cos:0.709451 l_trace:1.01575e+07 l_fro:2.26069e+06 l_trace_fraction:0.5 l_top_eval:1.76534e+06 l_top_eval_fraction:0.173797
+diag step:1000 name:blocks.11.attn.proj.weight lr:0.011928571 weight_norm:70.09 grad_norm:2607.82 momentum_norm:4217.49 update_norm:19.8661 update_l0_norm:27.4948 relative_update:0.283436 relative_update_l0:0.392279 update_l0_cos:0.913245 update_grad_cos:0.225096 update_momentum_cos:0.657535 l_trace:2.26472e+07 l_fro:1.66569e+07 l_trace_fraction:0.5 l_top_eval:1.6645e+07 l_top_eval_fraction:0.734968
+diag step:1000 name:blocks.6.mlp.proj.weight lr:0.011928571 weight_norm:62.0916 grad_norm:5240.96 momentum_norm:11581.6 update_norm:19.9736 update_l0_norm:27.7128 relative_update:0.32168 relative_update_l0:0.446321 update_l0_cos:0.980445 update_grad_cos:0.421737 update_momentum_cos:0.8657 l_trace:8.42804e+07 l_fro:1.59532e+07 l_trace_fraction:0.5 l_top_eval:1.45898e+07 l_top_eval_fraction:0.173111
+step:1000/1500 val_loss:3.55842 train_time:463.286s step_avg:460.50ms
+diag step:1125 name:blocks.0.attn.q.weight lr:0.008952381 weight_norm:50.8755 grad_norm:1772.06 momentum_norm:4626.71 update_norm:17.3153 update_l0_norm:27.5545 relative_update:0.340347 relative_update_l0:0.541605 update_l0_cos:0.876275 update_grad_cos:0.347179 update_momentum_cos:0.71331 l_trace:1.02303e+07 l_fro:2.13445e+06 l_trace_fraction:0.5 l_top_eval:1.83195e+06 l_top_eval_fraction:0.179071
+diag step:1125 name:blocks.11.attn.proj.weight lr:0.008952381 weight_norm:70.0908 grad_norm:2582.74 momentum_norm:4719.81 update_norm:19.2964 update_l0_norm:27.4922 relative_update:0.275306 relative_update_l0:0.392237 update_l0_cos:0.907824 update_grad_cos:0.236642 update_momentum_cos:0.63993 l_trace:2.0923e+07 l_fro:1.39795e+07 l_trace_fraction:0.5 l_top_eval:1.39555e+07 l_top_eval_fraction:0.666995
+diag step:1125 name:blocks.6.mlp.proj.weight lr:0.008952381 weight_norm:61.5287 grad_norm:5091.59 momentum_norm:12514 update_norm:19.6296 update_l0_norm:27.7128 relative_update:0.319031 relative_update_l0:0.450404 update_l0_cos:0.979456 update_grad_cos:0.434915 update_momentum_cos:0.866997 l_trace:8.35696e+07 l_fro:1.05804e+07 l_trace_fraction:0.5 l_top_eval:7.59817e+06 l_top_eval_fraction:0.0909202
+step:1125/1500 val_loss:3.51879 train_time:520.827s step_avg:460.33ms
+diag step:1250 name:blocks.0.attn.q.weight lr:0.0059761905 weight_norm:50.4146 grad_norm:1606.41 momentum_norm:4716.57 update_norm:16.866 update_l0_norm:27.5597 relative_update:0.334546 relative_update_l0:0.54666 update_l0_cos:0.871731 update_grad_cos:0.376379 update_momentum_cos:0.721402 l_trace:9.04882e+06 l_fro:1.44144e+06 l_trace_fraction:0.5 l_top_eval:1.14111e+06 l_top_eval_fraction:0.126106
+diag step:1250 name:blocks.11.attn.proj.weight lr:0.0059761905 weight_norm:69.8067 grad_norm:2135.4 momentum_norm:4704.91 update_norm:18.8383 update_l0_norm:27.5165 relative_update:0.269863 relative_update_l0:0.394181 update_l0_cos:0.902886 update_grad_cos:0.27285 update_momentum_cos:0.66529 l_trace:1.53804e+07 l_fro:8.7807e+06 l_trace_fraction:0.5 l_top_eval:8.75554e+06 l_top_eval_fraction:0.569267
+diag step:1250 name:blocks.6.mlp.proj.weight lr:0.0059761905 weight_norm:60.8635 grad_norm:4809.39 momentum_norm:13205.9 update_norm:19.2484 update_l0_norm:27.7128 relative_update:0.316255 relative_update_l0:0.455327 update_l0_cos:0.978672 update_grad_cos:0.450945 update_momentum_cos:0.872497 l_trace:7.74027e+07 l_fro:7.22807e+06 l_trace_fraction:0.5 l_top_eval:4.77713e+06 l_top_eval_fraction:0.0617179
+step:1250/1500 val_loss:3.48114 train_time:578.370s step_avg:460.34ms
+diag step:1375 name:blocks.0.attn.q.weight lr:0.003 weight_norm:50.0054 grad_norm:1605.95 momentum_norm:5269.1 update_norm:16.9996 update_l0_norm:27.5555 relative_update:0.339956 relative_update_l0:0.55105 update_l0_cos:0.871442 update_grad_cos:0.359416 update_momentum_cos:0.696945 l_trace:1.08991e+07 l_fro:1.82092e+06 l_trace_fraction:0.5 l_top_eval:1.38906e+06 l_top_eval_fraction:0.127447
+diag step:1375 name:blocks.11.attn.proj.weight lr:0.003 weight_norm:69.506 grad_norm:1977.73 momentum_norm:5654.39 update_norm:18.7446 update_l0_norm:27.5087 relative_update:0.269683 relative_update_l0:0.395774 update_l0_cos:0.90222 update_grad_cos:0.285558 update_momentum_cos:0.605531 l_trace:1.81295e+07 l_fro:9.63475e+06 l_trace_fraction:0.5 l_top_eval:9.51138e+06 l_top_eval_fraction:0.524635
+diag step:1375 name:blocks.6.mlp.proj.weight lr:0.003 weight_norm:60.318 grad_norm:4784.81 momentum_norm:14736.5 update_norm:19.3601 update_l0_norm:27.7128 relative_update:0.320967 relative_update_l0:0.459445 update_l0_cos:0.978767 update_grad_cos:0.453709 update_momentum_cos:0.850008 l_trace:9.14465e+07 l_fro:9.28547e+06 l_trace_fraction:0.5 l_top_eval:5.5619e+06 l_top_eval_fraction:0.0608214
+step:1375/1500 val_loss:3.45160 train_time:635.932s step_avg:460.49ms
+diag step:1500 name:blocks.0.attn.q.weight lr:2.3809524e-05 weight_norm:49.8226 grad_norm:1705.53 momentum_norm:5617.56 update_norm:16.2318 update_l0_norm:27.5474 relative_update:0.325792 relative_update_l0:0.55291 update_l0_cos:0.863372 update_grad_cos:0.350757 update_momentum_cos:0.688576 l_trace:9.36409e+06 l_fro:1.45393e+06 l_trace_fraction:0.5 l_top_eval:1.13517e+06 l_top_eval_fraction:0.121225
+diag step:1500 name:blocks.11.attn.proj.weight lr:2.3809524e-05 weight_norm:69.3715 grad_norm:1890.86 momentum_norm:6406.59 update_norm:16.8101 update_l0_norm:27.4879 relative_update:0.24232 relative_update_l0:0.396243 update_l0_cos:0.88226 update_grad_cos:0.306989 update_momentum_cos:0.584694 l_trace:1.23662e+07 l_fro:5.3682e+06 l_trace_fraction:0.5 l_top_eval:5.28871e+06 l_top_eval_fraction:0.427674
+diag step:1500 name:blocks.6.mlp.proj.weight lr:2.3809524e-05 weight_norm:60.0855 grad_norm:4830.15 momentum_norm:16395 update_norm:18.2546 update_l0_norm:27.7128 relative_update:0.303811 relative_update_l0:0.461223 update_l0_cos:0.974132 update_grad_cos:0.46106 update_momentum_cos:0.848755 l_trace:7.718e+07 l_fro:5.64786e+06 l_trace_fraction:0.5 l_top_eval:3.29228e+06 l_top_eval_fraction:0.0426571
+step:1500/1500 val_loss:3.43362 train_time:693.471s step_avg:460.32ms

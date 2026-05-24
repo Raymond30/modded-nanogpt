@@ -1,6 +1,6 @@
 # Leon L=0 Comparison Notes
 
-Last updated: 2026-05-05 14:20 America/Chicago
+Last updated: 2026-05-22 18:40 America/Chicago
 
 This note compares standard Leon against the Leon `L=0` control run and records the current interpretation plus a diagnostic plan. The authoritative row-level ledger remains `records/track_3_optimization/tuning_log.csv`.
 
@@ -212,3 +212,124 @@ That historical result did not improve the trajectory, which is why the current 
 Do not continue tuning full nonzero-`L` Leon blindly. The diagnostics now confirm that the second-momentum term mostly shrinks the effective update through trace domination by stale `L`, with secondary rotation.
 
 The next useful algorithm probes are changes that prevent `L` from dominating the denominator or stale-normalizing the current Nesterov update: much smaller `L` scale, different `beta2`, delayed `L` activation, clipping/normalizing `tr(L)`, or computing the Gram statistics from the same update vector being orthogonalized. For matching Muon Leon-NS, `L=0` remains the clean control.
+
+## 2026-05-22 Follow-Up: tr(L) Fraction Pinning and Update-Norm Matching
+
+Two new knobs in `train_gpt_simple_leon.py`:
+
+- `leon_l_normalize_mode = "match_g"`: rescales `L` so `tr(L) = leon_l_scale * ||G||_F^2` before the existing trace normalization. At `leon_l_scale = 1.0` the resulting trace fraction is exactly 0.5 every step.
+- `leon_match_l0_norm = True`: rescales the final NS output to Frobenius norm `sqrt(min(D1, D2))`, matching the natural L=0 (Muon-NS) update norm before the aspect-ratio multiplier.
+
+The first-moment and second-moment buffers were also switched from EMA storage (`lerp_` + `/(1 - decay)`) to direct unnormalized exponential sums `S_t = mu*S_{t-1} + grad_t` and `T_t = beta2*T_{t-1} + g g^T`. Behavior is mathematically equivalent; the code is cleaner.
+
+All four runs use `train_steps=500`, 4 H100s, `leon_lr=0.025`, `leon_wd=0.025`, `leon_mu=0.95`, `leon_beta2=0.7`, `leon_cooldown_frac=0.7`, `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, `leon_eps=1e-12`, diagnostics every 125 steps, wandb project `modded-nanogpt-track3`.
+
+### Val trajectories
+
+| Step | L=0 ref | L=1 baseline | A: match_g (frac=0.5) | B: match_l0_norm |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 10.82584 | 10.82584 | 10.82584 | 10.82584 |
+| 125 | 4.63749 | 4.58737 | 4.59188 | 4.72858 |
+| 250 | 4.06976 | 4.05694 | 4.05349 | 4.11233 |
+| 375 | 3.85318 | 3.84764 | 3.84652 | 3.88735 |
+| 500 | 3.75171 | 3.74774 | 3.74984 | 3.78380 |
+
+Final-step gaps relative to L=0:
+
+| Config | Final val | vs L=0 |
+| --- | ---: | ---: |
+| L=0 ref | 3.75171 | +0.00000 |
+| L=1 baseline | 3.74774 | -0.00397 |
+| A: match_g | 3.74984 | -0.00187 |
+| B: match_l0_norm | 3.78380 | +0.03209 |
+
+### Diagnostic averages (q.weight at blocks.0.attn)
+
+| Step | Config | `update_norm` | `update_l0_norm` | `cos(update, update_L0)` | `l_trace_fraction` |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 125 | L=0 | 27.43 | 27.43 | 1.000 | 0.000 |
+| 125 | L=1 | 20.09 | 27.44 | 0.909 | 0.431 |
+| 125 | match_g | 19.30 | 27.47 | 0.902 | 0.500 |
+| 125 | match_l0_norm | 27.71 | 27.46 | 0.912 | 0.362 |
+| 250 | L=1 | 20.15 | 27.50 | 0.911 | 0.394 |
+| 250 | match_g | 18.41 | 27.51 | 0.892 | 0.500 |
+| 250 | match_l0_norm | 27.71 | 27.38 | 0.918 | 0.258 |
+| 375 | L=1 | 20.30 | 27.54 | 0.913 | 0.275 |
+| 375 | match_g | 17.79 | 27.54 | 0.883 | 0.500 |
+| 375 | match_l0_norm | 27.71 | 27.55 | 0.917 | 0.278 |
+| 500 | L=1 | 20.48 | 27.48 | 0.918 | 0.179 |
+| 500 | match_g | 16.18 | 27.49 | 0.865 | 0.500 |
+| 500 | match_l0_norm | 27.71 | 27.50 | 0.922 | 0.175 |
+
+`update_norm` for `match_l0_norm` is pinned at `sqrt(768) = 27.71` as designed. `l_trace_fraction` for `match_g` is exactly 0.5 every step as designed.
+
+### Findings
+
+1. With `float32` + `ns_iters=12`, the standard L=1 (unnormalized-sum) and L=0 trajectories sit within ~0.004 of each other at 500 steps. The large 500-step gap in the bf16 + `ns_iters=6` diagnostics in [the original sweep](#diagnostic-scale-sweep) is no longer reproduced. The Leon vs Muon-NS gap visible in the [1500-step trajectory table](#standard-leon-vs-leon-l0-trajectory) is therefore more about NS precision than about the second-momentum term, at least early in training.
+2. Forcing `tr(L)` fraction to exactly 0.5 (`match_g`, l_scale=1.0) is statistically a wash versus the unnormalized-sum L=1 baseline. The update norm is *more* damped (~70% of L=0 norm vs ~73% for the baseline) and the cosine alignment with `update_L0` is slightly *lower* (0.87 vs 0.92 at step 500), but the validation trajectory is essentially identical.
+3. Rescaling the update to match the L=0 Frobenius norm (`match_l0_norm`) **hurts** by +0.032 at step 500. The directional information is the same (cos vs update_L0 is the highest of the three, ~0.92), but undoing the damping makes the per-step move too aggressive in the regions where `L` was correctly preconditioning. This is consistent with the natural per-layer damping serving as an adaptive learning-rate signal rather than a pure shrinkage that needs to be corrected.
+
+### Implications
+
+- The "L over-damps the update" interpretation from the bf16 + `ns_iters=6` sweep should be re-stated. With higher-precision NS (float32, 12 iters), the damping that `L` introduces is approximately benign at 500 steps; it does not need to be cancelled out. The remaining 1500-step gap from the older bf16 runs is likely a precision artifact that scales with `||L||`.
+- `match_l0_norm` is not a useful intervention — it discards the per-layer adaptive scaling that `L` is providing.
+- Worth retesting at 1500 steps before drawing a firm conclusion: the existing 1500-step Leon vs L=0 table used `ns_iters=6`, `bfloat16`, and `eps=1e-9`. A clean head-to-head at `float32` + `ns_iters=12` would confirm whether the gap collapses.
+
+## 2026-05-22 1500-Step Revalidation
+
+Same four configs as the 500-step screen, extended to `train_steps=1500`. All other knobs identical: 4 H100s, `leon_lr=0.025`, `leon_wd=0.025`, `leon_mu=0.95`, `leon_beta2=0.7`, `leon_cooldown_frac=0.7`, `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, `leon_eps=1e-12`, diagnostics every 125 steps, wandb project `modded-nanogpt-track3`. Diagnostic `relative_update*` keys are now lr-free (`||U||_F / ||W||_F`).
+
+### Val trajectories
+
+| Step | L=0 ref | L=1 baseline | A: match_g | B: match_l0_norm |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 10.82584 | 10.82584 | 10.82584 | 10.82584 |
+| 125 | 4.63383 | 4.57431 | 4.57564 | 4.71833 |
+| 250 | 4.10859 | 4.09326 | 4.08884 | 4.13491 |
+| 375 | 3.92496 | 3.92131 | 3.91419 | 3.94600 |
+| 500 | 3.81655 | 3.81557 | 3.80913 | 3.83415 |
+| 625 | 3.73044 | 3.73104 | 3.72579 | 3.74433 |
+| 750 | 3.66503 | 3.66780 | 3.66112 | 3.67849 |
+| 875 | 3.60892 | 3.61326 | 3.60645 | 3.62249 |
+| 1000 | 3.56024 | 3.56399 | 3.55842 | 3.57239 |
+| 1125 | 3.51987 | 3.52393 | 3.51879 | 3.53271 |
+| 1250 | 3.48187 | 3.48581 | 3.48114 | 3.49418 |
+| 1375 | 3.45130 | 3.45515 | 3.45160 | 3.46330 |
+| 1500 | 3.43230 | 3.43581 | 3.43362 | 3.44404 |
+
+### Final-step gaps vs L=0
+
+| Config | Final val | vs L=0 |
+| --- | ---: | ---: |
+| L=0 ref | 3.43230 | +0.00000 |
+| L=1 baseline | 3.43581 | +0.00351 |
+| A: match_g | 3.43362 | +0.00132 |
+| B: match_l0_norm | 3.44404 | +0.01174 |
+
+Compared to the [original bf16 + `ns_iters=6` 1500-step gap](#standard-leon-vs-leon-l0-trajectory) of `-0.12540` (L=0 minus standard L=1), the gap is now only `+0.00351` and *favors L=0 over L=1 by 0.0035*. The order has not flipped but the magnitude has collapsed by ~36x.
+
+### Diagnostic snapshot (blocks.0.attn.q.weight)
+
+| Step | Config | ‖U‖/‖W‖ | ‖U₀‖/‖W‖ | cos(U, U₀) | tr(L) fraction |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 125 | L=0 | 0.891 | 0.891 | 1.000 | 0.000 |
+| 125 | L=1 | 0.753 | 1.019 | 0.914 | 0.422 |
+| 125 | match_g | 0.775 | 1.087 | 0.904 | 0.500 |
+| 125 | match_l0_norm | 0.756 | 0.749 | 0.913 | 0.380 |
+| 750 | L=0 | 0.414 | 0.414 | 1.000 | 0.000 |
+| 750 | L=1 | 0.367 | 0.502 | 0.910 | 0.321 |
+| 750 | match_g | 0.348 | 0.543 | 0.879 | 0.500 |
+| 750 | match_l0_norm | 0.359 | 0.357 | 0.914 | 0.293 |
+| 1500 | L=0 | 0.415 | 0.415 | 1.000 | 0.000 |
+| 1500 | L=1 | 0.374 | 0.504 | 0.916 | 0.193 |
+| 1500 | match_g | 0.326 | 0.553 | 0.863 | 0.500 |
+| 1500 | match_l0_norm | 0.361 | 0.359 | 0.920 | 0.197 |
+
+Same qualitative picture as the 500-step screen, now at full benchmark length. `match_g` pins `tr(L)` fraction at 0.5 exactly. `match_l0_norm` pins `‖U‖` to ≈ `‖U₀‖`. `match_g`'s `cos(U, U₀)` drifts down to 0.86 by step 1500 (more rotation than baseline), and its `‖U‖/‖W‖` is the smallest of the four (~0.33), suggesting the rescaled `L` mildly suppresses the effective step.
+
+### Revised conclusions
+
+1. **The old "L over-damps the update" interpretation does not survive float32 + 12-iter NS.** With higher-precision orthogonalization the standard nonzero-`L` trajectory tracks L=0 to within ~0.004 over 1500 steps. The 0.125 gap reported in the original [Standard Leon vs Leon L=0 Trajectory](#standard-leon-vs-leon-l0-trajectory) table appears to be primarily a low-precision NS artifact, not a fundamental algorithmic problem.
+2. **Pinning the trace fraction to 0.5** (`match_g`) gives the slightly best L=1 variant (3.43362, +0.00132 vs L=0), but the improvement is well inside run-to-run noise and the diagnostic shows it costs some cosine alignment with the L=0 direction.
+3. **Matching the L=0 update Frobenius norm** (`match_l0_norm`) consistently *hurts* (+0.01174 at 1500 steps, +0.03209 at 500 steps). The directional information is fine (cos with `U₀` is the highest of the three) but undoing the natural per-layer damping inflates `‖W‖` and ends in a worse optimum.
+4. The natural EMA-Gram preconditioner is acting as an adaptive per-layer step-size brake, and that brake is approximately neutral-to-mildly-helpful when NS is precise enough to track it faithfully. Future work on `L` should focus on probes that *exploit* the brake (e.g., raising `lr` while keeping `L` on) rather than removing it.

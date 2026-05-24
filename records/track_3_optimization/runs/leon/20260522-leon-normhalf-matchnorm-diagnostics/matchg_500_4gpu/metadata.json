@@ -1,0 +1,42 @@
+{
+  "argv": [
+    "records/track_3_optimization/train_gpt_simple_leon.py",
+    "--trials",
+    "1",
+    "--out-dir",
+    "records/track_3_optimization/runs/leon/20260522-leon-normhalf-matchnorm-diagnostics/matchg_500_4gpu",
+    "--set",
+    "train_steps=500",
+    "--set",
+    "leon_l_scale=1.0",
+    "--set",
+    "leon_l_normalize_mode=match_g",
+    "--set",
+    "leon_ns_iters=12",
+    "--set",
+    "leon_orthogonalize_dtype=float32",
+    "--set",
+    "leon_eps=1e-12",
+    "--set",
+    "leon_log_diagnostics=True",
+    "--set",
+    "wandb_project=modded-nanogpt-track3",
+    "--set",
+    "wandb_run_name=leon_matchg_500_diag"
+  ],
+  "cuda_version": "12.8",
+  "cwd": "/mnt/nas/rj23424/modded-nanogpt",
+  "device_name": "NVIDIA H100 NVL",
+  "dry_run": false,
+  "git_commit": "060bed92ffe2b11b3fc26a4e2ebb48a411db38d3",
+  "mode": "train",
+  "out_dir": "records/track_3_optimization/runs/leon/20260522-leon-normhalf-matchnorm-diagnostics/matchg_500_4gpu",
+  "script": "records/track_3_optimization/train_gpt_simple_leon.py",
+  "shard_counts": {
+    "train_shards": 103,
+    "val_shards": 1
+  },
+  "torch_version": "2.11.0+cu128",
+  "trials": 1,
+  "world_size": 4
+}
