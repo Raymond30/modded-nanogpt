@@ -6,6 +6,7 @@ It was prepared as a simplified version of the speedrun for use in neural net op
 This variant replaces Muon with Leon (initial test using the same Newton-Schulz coefficients).
 """
 
+import math
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -53,6 +54,9 @@ BASE_HPARAMS = dict(
     # When True, rescale the final NS output to Frobenius norm sqrt(min(D1, D2)),
     # i.e. match the natural ||update||_F of the L=0 (Muon-NS) update.
     leon_match_l0_norm  = False,
+    # When True, second moment accumulates (grad_t - grad_{t-1})(grad_t - grad_{t-1})^T
+    # instead of grad_t * grad_t^T.
+    leon_use_grad_diff  = False,
     leon_log_diagnostics = False,
     leon_diag_interval  = 125,
     leon_diag_patterns  = (
@@ -143,6 +147,11 @@ def validate_hparams(hparams):
         raise ValueError(
             "leon_l_normalize_mode must be 'off' or 'match_g', "
             f"got {normalize_mode!r}"
+        )
+
+    if not isinstance(hparams["leon_use_grad_diff"], bool):
+        raise TypeError(
+            f"leon_use_grad_diff must be bool, got {type(hparams['leon_use_grad_diff'])!r}"
         )
 
 
@@ -396,7 +405,9 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
                        eps: float = 1e-7, l_scale: float = 1.0,
                        compute_dtype: str = "bfloat16",
                        l_normalize_mode: str = "off",
-                       match_l0_norm: bool = False) -> Tensor:
+                       match_l0_norm: bool = False,
+                       use_grad_diff: bool = False,
+                       prev_grad_buffer: Tensor = None) -> Tensor:
     """
     Leon update: Nesterov momentum + Newton-Schulz orthogonalization with
     augmented Gram matrix (second momentum buffer).
@@ -427,10 +438,16 @@ def leon_orthogonalize(grad: Tensor, momentum_buffer: Tensor, second_momentum_bu
     accum_dtype = leon_accum_dtype(compute_dtype)
 
     # 0. Compute Gram matrix of raw gradient BEFORE mutating it with momentum
-    if is_tall:
-        gram_tmp = grad.mT @ grad
+    if use_grad_diff and prev_grad_buffer is not None:
+        gram_src = grad - prev_grad_buffer
+        prev_grad_buffer.copy_(grad)  # store raw grad before momentum mutation
     else:
-        gram_tmp = grad @ grad.mT
+        gram_src = grad
+
+    if is_tall:
+        gram_tmp = gram_src.mT @ gram_src
+    else:
+        gram_tmp = gram_src @ gram_src.mT
 
     # Both buffers are stored as unnormalized exponential sums:
     #   S_t = momentum * S_{t-1} + grad_t          (first moment)
@@ -513,14 +530,15 @@ class Leon(torch.optim.Optimizer):
     """
     def __init__(self, params, lr=0.025, weight_decay=0.025, mu=0.95, beta2=0.7,
                  ns_iters=6, eps=1e-7, l_scale=1.0, orthogonalize_dtype="bfloat16",
-                 l_normalize_mode="off", match_l0_norm=False):
+                 l_normalize_mode="off", match_l0_norm=False, use_grad_diff=False):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, beta2=beta2,
                         ns_iters=ns_iters, eps=eps, l_scale=l_scale,
                         orthogonalize_dtype=orthogonalize_dtype,
                         l_normalize_mode=l_normalize_mode,
-                        match_l0_norm=match_l0_norm)
+                        match_l0_norm=match_l0_norm,
+                        use_grad_diff=use_grad_diff)
         super().__init__(params, defaults)
         self.param_names = {}
 
@@ -556,10 +574,20 @@ class Leon(torch.optim.Optimizer):
                         momentum_buffer = state["momentum_buffer"]
                         second_momentum_buffer = state["second_momentum_buffer"]
 
+                    prev_grad_buffer = state.get("prev_grad_buffer")
+                    prev_grad_clone = prev_grad_buffer.clone() if prev_grad_buffer is not None else None
+
                     grad = p.grad.float()
                     momentum_clone = momentum_buffer.clone()
                     l_clone = second_momentum_buffer.clone()
                     grad_for_update = grad.clone()
+
+                    # Compute grad_diff_norm before leon_orthogonalize mutates prev_grad_clone
+                    if prev_grad_clone is not None:
+                        grad_diff_norm = (grad_for_update - prev_grad_clone).float().norm()
+                    else:
+                        grad_diff_norm = math.nan
+
                     update = leon_orthogonalize(
                         grad_for_update, momentum_clone, l_clone,
                         momentum=group["mu"], beta2=group["beta2"],
@@ -568,6 +596,8 @@ class Leon(torch.optim.Optimizer):
                         compute_dtype=group["orthogonalize_dtype"],
                         l_normalize_mode=group["l_normalize_mode"],
                         match_l0_norm=group["match_l0_norm"],
+                        use_grad_diff=group.get("use_grad_diff", False),
+                        prev_grad_buffer=prev_grad_clone,
                     )
                     update *= max(1, p.size(-2) / p.size(-1))**0.5
 
@@ -631,6 +661,7 @@ class Leon(torch.optim.Optimizer):
                         lr=float(group["lr"]),
                         weight_norm=float(weight_norm.item()),
                         grad_norm=float(grad_norm.item()),
+                        grad_diff_norm=float(grad_diff_norm) if isinstance(grad_diff_norm, float) else float(grad_diff_norm.item()),
                         momentum_norm=float(momentum_norm.item()),
                         update_norm=float(update_norm.item()),
                         update_l0_norm=float(update_l0_norm.item()),
@@ -665,6 +696,8 @@ class Leon(torch.optim.Optimizer):
                         state["second_momentum_buffer"] = torch.zeros(
                             min_D, min_D, dtype=torch.float32, device=p.device
                         )
+                        if group["use_grad_diff"]:
+                            state["prev_grad_buffer"] = torch.zeros_like(p, dtype=torch.float32)
                     grad = p.grad.float()
                     update = leon_orthogonalize(
                         grad, state["momentum_buffer"], state["second_momentum_buffer"],
@@ -674,6 +707,8 @@ class Leon(torch.optim.Optimizer):
                         compute_dtype=group["orthogonalize_dtype"],
                         l_normalize_mode=group["l_normalize_mode"],
                         match_l0_norm=group["match_l0_norm"],
+                        use_grad_diff=group["use_grad_diff"],
+                        prev_grad_buffer=state.get("prev_grad_buffer"),
                     )
                     update *= max(1, p.size(-2) / p.size(-1))**0.5
                     p.mul_(1 - group["lr"] * group["weight_decay"])
@@ -804,7 +839,8 @@ def main():
                               l_scale=hparams["leon_l_scale"],
                               orthogonalize_dtype=hparams["leon_orthogonalize_dtype"],
                               l_normalize_mode=hparams["leon_l_normalize_mode"],
-                              match_l0_norm=hparams["leon_match_l0_norm"])
+                              match_l0_norm=hparams["leon_match_l0_norm"],
+                              use_grad_diff=hparams["leon_use_grad_diff"])
             optimizer2.param_names = {p: name for name, p in model.named_parameters()}
             optimizers = [optimizer1, optimizer2]
             assert set(p for opt in optimizers for group in opt.param_groups
@@ -855,6 +891,7 @@ def main():
                         + f" lr:{row['lr']:.8g}"
                         + f" weight_norm:{row['weight_norm']:.6g}"
                         + f" grad_norm:{row['grad_norm']:.6g}"
+                        + f" grad_diff_norm:{row['grad_diff_norm']:.6g}"
                         + f" momentum_norm:{row['momentum_norm']:.6g}"
                         + f" update_norm:{row['update_norm']:.6g}"
                         + f" update_l0_norm:{row['update_l0_norm']:.6g}"

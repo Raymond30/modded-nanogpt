@@ -333,3 +333,59 @@ Same qualitative picture as the 500-step screen, now at full benchmark length. `
 2. **Pinning the trace fraction to 0.5** (`match_g`) gives the slightly best L=1 variant (3.43362, +0.00132 vs L=0), but the improvement is well inside run-to-run noise and the diagnostic shows it costs some cosine alignment with the L=0 direction.
 3. **Matching the L=0 update Frobenius norm** (`match_l0_norm`) consistently *hurts* (+0.01174 at 1500 steps, +0.03209 at 500 steps). The directional information is fine (cos with `U₀` is the highest of the three) but undoing the natural per-layer damping inflates `‖W‖` and ends in a worse optimum.
 4. The natural EMA-Gram preconditioner is acting as an adaptive per-layer step-size brake, and that brake is approximately neutral-to-mildly-helpful when NS is precise enough to track it faithfully. Future work on `L` should focus on probes that *exploit* the brake (e.g., raising `lr` while keeping `L` on) rather than removing it.
+
+## 2026-05-24: Gradient-Difference Second Moment
+
+New variant: second moment accumulates outer products of consecutive gradient differences rather than raw gradients:
+
+```
+T_t = beta2 * T_{t-1} + (grad_t - grad_{t-1}) * (grad_t - grad_{t-1})^T
+```
+
+Enabled via `leon_use_grad_diff=True`. `prev_grad_buffer` (zeros at step 0, float32) is stored in optimizer state. At step 0 delta = grad − 0 = grad, matching the baseline. Run `20260524-164921-dc8e6616`: 500 steps, 4× H100 NVL (2.11.0+cu128/12.8), same shared settings as the 2026-05-22 500-step screen (`leon_lr=0.025`, `leon_wd=0.025`, `leon_mu=0.95`, `leon_beta2=0.7`, `leon_cooldown_frac=0.7`, `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, `leon_eps=1e-12`, diagnostics every 125 steps).
+
+### Val trajectory
+
+| Step | L=0 ref (existing) | L=1 baseline (existing) | C: grad-diff L=1 (new) | grad-diff vs L=1 |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 10.82584 | 10.82584 | 10.82584 | +0.00000 |
+| 125 | 4.63749 | 4.58737 | **4.57622** | **−0.01115** |
+| 250 | 4.06976 | 4.05694 | **4.05423** | **−0.00271** |
+| 375 | 3.85318 | 3.84764 | 3.84771 | +0.00007 |
+| 500 | 3.75171 | 3.74774 | 3.74790 | +0.00016 |
+
+The grad-diff variant shows a meaningful early advantage (−0.011 at step 125, −0.003 at step 250) that is larger than typical run-to-run noise, but converges to essentially the same level as the L=1 baseline by step 500 (within 0.0002). It is also better than L=0 at every checkpoint.
+
+### Diagnostic averages (3-layer mean: blocks.0.attn.q.weight, blocks.6.mlp.proj.weight, blocks.11.attn.proj.weight)
+
+| Step | `tr(L) frac` | `‖U‖/‖U_L0‖` | `cos(U, U_L0)` | `rel_update` | `grad_diff_norm/grad_norm` |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 125 | 0.724 | 0.688 | 0.893 | 0.702 | 1.746 |
+| 250 | 0.701 | 0.686 | 0.904 | 0.519 | 1.561 |
+| 375 | 0.574 | 0.697 | 0.912 | 0.495 | 1.456 |
+| 500 | 0.320 | 0.715 | 0.919 | 0.504 | 1.302 |
+
+For reference, the existing L=1 baseline diagnostic at step 125 (blocks.0.attn.q.weight only): `tr_frac=0.431`, `‖U‖/‖U_L0‖=0.732`, `cos=0.909`.
+
+### Diagnostic snapshot (blocks.0.attn.q.weight only)
+
+| Step | `‖U‖/‖W‖` | `‖U₀‖/‖W‖` | `cos(U, U₀)` | `tr(L) frac` | `grad_diff_norm` |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 125 | 0.753 | 1.123 | 0.877 | 0.660 | 9822 |
+| 250 | 0.560 | 0.839 | 0.880 | 0.592 | 6646 |
+| 375 | 0.533 | 0.794 | 0.883 | 0.469 | 3408 |
+| 500 | 0.540 | 0.793 | 0.887 | 0.327 | 3238 |
+
+`grad_diff_norm` is ~1.7× `grad_norm` early (step 125), declining to ~1.3× by step 500. This ratio > 1 is consistent with gradient magnitude shrinking fast in early training so that `‖grad_t − grad_{t-1}‖ > ‖grad_t‖`.
+
+### Findings
+
+1. **Early-phase advantage.** The grad-diff variant improves step-125 val_loss by 0.011 over the L=1 baseline and 0.061 over L=0. This advantage is larger than typical single-run noise and the directionality (grad-diff better than both alternatives early) suggests genuine signal.
+2. **Late-phase convergence.** By step 500 the trajectories equalize. The final difference vs L=1 is only +0.0002 (a virtual tie), so the grad-diff second moment neither helps nor hurts once training stabilizes.
+3. **Higher tr(L) fraction early.** Because `grad_diff_norm` is ~1.75× `grad_norm` at step 125, the accumulated `L` is larger than for raw-gradient L at the same `beta2`. Despite this, the early loss is better — so the qualitative "more L hurts" finding from the original bfloat16 diagnostics does not hold for the grad-diff variant. The *kind* of information in `L` matters, not just its scale.
+4. **cos(U, U_L0)** is slightly lower than the L=1 baseline at steps 125–250 (~0.877–0.880 vs ~0.909–0.911). The grad-diff `L` introduces more directional rotation of the update than raw-grad `L`, which may partly explain the early advantage.
+5. **`grad_diff_norm` is a useful diagnostic.** It tracks gradient velocity and confirms that gradients are changing rapidly early in training (ratio >1 means the inter-step gradient change exceeds the current gradient magnitude).
+
+### Next step
+
+Extend to 1500 steps (decision rule met: grad-diff tied/better than baseline at step 500). The 500-step early advantage pattern may or may not persist: `tr_frac` for grad-diff is already converging toward the L=1 baseline value by step 500 (0.320 vs 0.179), suggesting the two variants become more similar as training progresses and gradients stabilize. Run C baseline comparison at 1500 steps will confirm whether the early gain translates to any residual advantage at benchmark length.
