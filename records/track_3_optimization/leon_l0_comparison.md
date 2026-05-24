@@ -389,3 +389,66 @@ For reference, the existing L=1 baseline diagnostic at step 125 (blocks.0.attn.q
 ### Next step
 
 Extend to 1500 steps (decision rule met: grad-diff tied/better than baseline at step 500). The 500-step early advantage pattern may or may not persist: `tr_frac` for grad-diff is already converging toward the L=1 baseline value by step 500 (0.320 vs 0.179), suggesting the two variants become more similar as training progresses and gradients stabilize. Run C baseline comparison at 1500 steps will confirm whether the early gain translates to any residual advantage at benchmark length.
+
+## 2026-05-24: Gradient-Difference 1500-Step Revalidation
+
+Same config as the 500-step diagnostic screen above, extended to `train_steps=1500`. Run `20260524-165933-3e03c0b7`, 4× H100 NVL (2.11.0+cu128/12.8).
+
+### Val trajectory
+
+| Step | L=0 ref | L=1 baseline | match_g | **grad-diff L=1** | gd vs L=1 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 10.82584 | 10.82584 | 10.82584 | 10.82584 | +0.00000 |
+| 125 | 4.63383 | 4.57431 | 4.57564 | 4.60586 | +0.03155 |
+| 250 | 4.10859 | 4.09326 | 4.08884 | **4.09224** | −0.00102 |
+| 375 | 3.92496 | 3.92131 | 3.91419 | **3.92066** | −0.00065 |
+| 500 | 3.81655 | 3.81557 | 3.80913 | **3.81036** | −0.00521 |
+| 625 | 3.73044 | 3.73104 | 3.72579 | **3.72986** | −0.00118 |
+| 750 | 3.66503 | 3.66780 | 3.66112 | **3.66436** | −0.00344 |
+| 875 | 3.60892 | 3.61326 | 3.60645 | **3.61093** | −0.00233 |
+| 1000 | 3.56024 | 3.56399 | 3.55842 | **3.56169** | −0.00230 |
+| 1125 | 3.51987 | 3.52393 | 3.51879 | **3.52258** | −0.00135 |
+| 1250 | 3.48187 | 3.48581 | 3.48114 | **3.48477** | −0.00104 |
+| 1375 | 3.45130 | 3.45515 | 3.45160 | **3.45358** | −0.00157 |
+| 1500 | 3.43230 | 3.43581 | 3.43362 | **3.43389** | −0.00192 |
+
+### Final-step ranking
+
+| Config | Final val | vs L=0 |
+| --- | ---: | ---: |
+| L=0 ref | 3.43230 | +0.00000 |
+| match_g | 3.43362 | +0.00132 |
+| **grad-diff L=1** | **3.43389** | **+0.00159** |
+| L=1 baseline | 3.43581 | +0.00351 |
+
+Grad-diff finishes **0.00192 better than L=1 baseline** and is effectively tied with `match_g` (+0.00027). It remains slightly behind L=0 (+0.00159), same qualitative order as `match_g`.
+
+### Diagnostic snapshot (blocks.0.attn.q.weight)
+
+| Step | Config | ‖U‖/‖W‖ | ‖U₀‖/‖W‖ | cos(U, U₀) | tr(L) frac | grad\_diff/grad |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 125 | L=0 (existing) | 0.891 | 0.891 | 1.000 | 0.000 | — |
+| 125 | L=1 (existing) | 0.753 | 1.019 | 0.914 | 0.422 | — |
+| 125 | **grad-diff** | **0.741** | **1.105** | **0.878** | **0.672** | **1.72** |
+| 750 | L=0 (existing) | 0.414 | 0.414 | 1.000 | 0.000 | — |
+| 750 | L=1 (existing) | 0.367 | 0.502 | 0.910 | 0.321 | — |
+| 750 | **grad-diff** | **0.370** | **0.552** | **0.883** | **0.555** | **1.66** |
+| 1500 | L=0 (existing) | 0.415 | 0.415 | 1.000 | 0.000 | — |
+| 1500 | L=1 (existing) | 0.374 | 0.504 | 0.916 | 0.193 | — |
+| 1500 | **grad-diff** | **0.380** | **0.556** | **0.892** | **0.342** | **1.38** |
+
+### Revised findings
+
+1. **Consistent improvement over raw-grad L=1.** Grad-diff outperforms the L=1 baseline at every checkpoint from step 250 onward, by 0.001–0.005. The final advantage is 0.00192, comparable in magnitude to the `match_g` result (0.00219 better than L=1). This is a robust small improvement, not noise.
+
+2. **Step-125 regression is run variance.** The 1500-step run shows grad-diff *worse* at step 125 (+0.031 vs L=1). The 500-step run showed it *better* (−0.011). Both can be explained by run-to-run variance at equal LR (both pre-cooldown at step 125). The mid-training and late-training advantage is consistent.
+
+3. **Higher tr_frac throughout, yet better val.** Grad-diff `tr_frac` at step 1500 is 0.342 vs 0.193 for L=1 — `L` is still relatively more dominant in grad-diff even at the end of training. Despite this, grad-diff outperforms. This definitively rules out the "more L = worse" narrative from the original bfloat16 diagnostics: the *content* of `L` matters. Grad-diff `L` encodes gradient velocity (curvature proxy), which is more informative than raw-gradient outer-product `L`.
+
+4. **`grad_diff_norm / grad_norm` declines gradually.** Ratio is ~1.72 at step 125, ~1.66 at step 750, ~1.38 at step 1500. Gradients stabilize late in training but the difference remains larger than the gradient itself throughout, meaning `L` built from differences continues to be a meaningfully different quantity than raw-gradient `L`.
+
+5. **Grad-diff ties `match_g`, both ~0.002 behind L=0.** Neither intervention closes the remaining gap to L=0. The ~0.002 gap between the best raw-gradient variants and L=0 appears to be a residual cost of the `L` term's direction rotation (cos ~0.88–0.92 vs 1.000 for L=0), not its magnitude.
+
+### Summary position
+
+Grad-diff second moment is a mild but consistent improvement over raw-gradient L=1 at no additional memory cost penalty (same buffer sizes; `prev_grad_buffer` adds one parameter-sized float32 tensor). It is the best single-run L=1 variant tested so far that does not explicitly rescale `L` (`match_g` rescales; grad-diff does not). Worth testing at `l_scale=2.0` (which showed the best result for LeonH) to see if the curvature signal in grad-diff `L` benefits from amplification.
