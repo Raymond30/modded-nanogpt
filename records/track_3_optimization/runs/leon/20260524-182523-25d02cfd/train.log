@@ -1007,3 +1007,108 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running PyTorch 2.11.0+cu128 compiled for CUDA 12.8 on NVIDIA H100 NVL with world_size 4
+{
+  "config_diff": {
+    "leon_eps": 1e-12,
+    "leon_log_diagnostics": true,
+    "leon_mu": 0.98,
+    "leon_ns_iters": 12,
+    "leon_orthogonalize_dtype": "float32",
+    "leon_use_grad_diff": true,
+    "train_steps": 1500,
+    "wandb_project": "modded-nanogpt-track3",
+    "wandb_run_name": "gd_mu098_1500"
+  },
+  "hparams": {
+    "adam_betas": [
+      0.8,
+      0.95
+    ],
+    "adam_cooldown_frac": 0.7,
+    "adam_eps": 1e-10,
+    "adam_wd": 0.0,
+    "embed_lr": 0.3,
+    "leon_beta2": 0.7,
+    "leon_cooldown_frac": 0.7,
+    "leon_diag_interval": 125,
+    "leon_diag_patterns": [
+      "blocks.0.attn.q.weight",
+      "blocks.6.mlp.proj.weight",
+      "blocks.11.attn.proj.weight"
+    ],
+    "leon_eps": 1e-12,
+    "leon_l_normalize_mode": "off",
+    "leon_l_scale": 1.0,
+    "leon_l_scale_ramp_end_frac": 0.6,
+    "leon_l_scale_ramp_start_frac": 0.2,
+    "leon_l_scale_schedule": "constant",
+    "leon_log_diagnostics": true,
+    "leon_lr": 0.025,
+    "leon_match_l0_norm": false,
+    "leon_mu": 0.98,
+    "leon_ns_iters": 12,
+    "leon_orthogonalize_dtype": "float32",
+    "leon_use_grad_diff": true,
+    "leon_use_nesterov": true,
+    "leon_wd": 0.025,
+    "proj_lr": 0.003125,
+    "scalar_lr": 0.01,
+    "train_steps": 1500,
+    "wandb_mode": "online",
+    "wandb_project": "modded-nanogpt-track3",
+    "wandb_run_name": "gd_mu098_1500"
+  }
+}
+====================================================================================================
+step:0/1500 val_loss:10.82584 train_time:0.001s step_avg:nanms
+diag step:125 name:blocks.0.attn.q.weight lr:0.025 weight_norm:33.3105 grad_norm:4081.92 grad_diff_norm:7273.82 momentum_norm:19671.8 update_norm:20.8976 update_l0_norm:27.4604 relative_update:0.627358 relative_update_l0:0.824377 update_l0_cos:0.917401 update_grad_cos:0.158973 update_momentum_cos:0.479574 l_trace:1.98123e+08 l_fro:9.65683e+07 l_trace_fraction:0.31967 l_top_eval:9.04175e+07 l_top_eval_fraction:0.456371
+diag step:125 name:blocks.11.attn.proj.weight lr:0.025 weight_norm:36.532 grad_norm:10985.9 grad_diff_norm:21046 momentum_norm:21386 update_norm:21.3208 update_l0_norm:26.6429 relative_update:0.58362 relative_update_l0:0.729303 update_l0_cos:0.917669 update_grad_cos:0.0341293 update_momentum_cos:0.304289 l_trace:1.16379e+09 l_fro:1.12682e+09 l_trace_fraction:0.714887 l_top_eval:1.12678e+09 l_top_eval_fraction:0.968202
+diag step:125 name:blocks.6.mlp.proj.weight lr:0.025 weight_norm:47.5836 grad_norm:7408.65 grad_diff_norm:14091.4 momentum_norm:29211.2 update_norm:22.9404 update_l0_norm:27.7128 relative_update:0.482108 relative_update_l0:0.582403 update_l0_cos:0.970248 update_grad_cos:0.144013 update_momentum_cos:0.463425 l_trace:6.2587e+08 l_fro:3.106e+08 l_trace_fraction:0.396532 l_top_eval:2.77957e+08 l_top_eval_fraction:0.444113
+step:125/1500 val_loss:4.64689 train_time:60.182s step_avg:481.45ms
+diag step:250 name:blocks.0.attn.q.weight lr:0.025 weight_norm:60.1375 grad_norm:2906.52 grad_diff_norm:4138.11 momentum_norm:8086.49 update_norm:21.0119 update_l0_norm:27.5216 relative_update:0.349398 relative_update_l0:0.457644 update_l0_cos:0.918427 update_grad_cos:0.167269 update_momentum_cos:0.597961 l_trace:5.5763e+07 l_fro:2.58036e+07 l_trace_fraction:0.401471 l_top_eval:2.44155e+07 l_top_eval_fraction:0.437845
+diag step:250 name:blocks.11.attn.proj.weight lr:0.025 weight_norm:66.8796 grad_norm:7035.12 grad_diff_norm:11884.9 momentum_norm:11569.8 update_norm:21.416 update_l0_norm:26.9896 relative_update:0.320217 relative_update_l0:0.403556 update_l0_cos:0.925899 update_grad_cos:0.0655368 update_momentum_cos:0.362552 l_trace:3.98736e+08 l_fro:3.85186e+08 l_trace_fraction:0.589202 l_top_eval:3.85176e+08 l_top_eval_fraction:0.965992
+diag step:250 name:blocks.6.mlp.proj.weight lr:0.025 weight_norm:73.3302 grad_norm:5036.99 grad_diff_norm:7981.06 momentum_norm:10813.5 update_norm:22.8382 update_l0_norm:27.7128 relative_update:0.311443 relative_update_l0:0.377918 update_l0_cos:0.978863 update_grad_cos:0.198853 update_momentum_cos:0.812147 l_trace:2.11373e+08 l_fro:8.90598e+07 l_trace_fraction:0.553369 l_top_eval:7.32229e+07 l_top_eval_fraction:0.346415
+step:250/1500 val_loss:4.12949 train_time:117.904s step_avg:461.77ms
+diag step:375 name:blocks.0.attn.q.weight lr:0.025 weight_norm:75.858 grad_norm:1805.41 grad_diff_norm:2731.97 momentum_norm:5218.57 update_norm:20.6798 update_l0_norm:27.5293 relative_update:0.272613 relative_update_l0:0.362905 update_l0_cos:0.91067 update_grad_cos:0.176096 update_momentum_cos:0.661255 l_trace:2.14756e+07 l_fro:8.68355e+06 l_trace_fraction:0.386542 l_top_eval:8.11007e+06 l_top_eval_fraction:0.377641
+diag step:375 name:blocks.11.attn.proj.weight lr:0.025 weight_norm:86.6387 grad_norm:4823.03 grad_diff_norm:7943.14 momentum_norm:6994.4 update_norm:21.307 update_l0_norm:27.2428 relative_update:0.245929 relative_update_l0:0.314442 update_l0_cos:0.922951 update_grad_cos:0.0694128 update_momentum_cos:0.453465 l_trace:1.89569e+08 l_fro:1.81675e+08 l_trace_fraction:0.638983 l_top_eval:1.8167e+08 l_top_eval_fraction:0.958335
+diag step:375 name:blocks.6.mlp.proj.weight lr:0.025 weight_norm:87.5971 grad_norm:3945.92 grad_diff_norm:6376.32 momentum_norm:9503.17 update_norm:22.8482 update_l0_norm:27.7128 relative_update:0.260833 relative_update_l0:0.316367 update_l0_cos:0.981421 update_grad_cos:0.222414 update_momentum_cos:0.84957 l_trace:1.38991e+08 l_fro:5.65571e+07 l_trace_fraction:0.53058 l_top_eval:5.02734e+07 l_top_eval_fraction:0.361703
+step:375/1500 val_loss:3.94211 train_time:175.442s step_avg:460.31ms
+diag step:500 name:blocks.0.attn.q.weight lr:0.023833333 weight_norm:85.144 grad_norm:1664.77 grad_diff_norm:2716.14 momentum_norm:4172.01 update_norm:20.3709 update_l0_norm:27.5324 relative_update:0.239252 relative_update_l0:0.323362 update_l0_cos:0.905185 update_grad_cos:0.19111 update_momentum_cos:0.673857 l_trace:1.9574e+07 l_fro:8.70848e+06 l_trace_fraction:0.45509 l_top_eval:7.96783e+06 l_top_eval_fraction:0.407062
+diag step:500 name:blocks.11.attn.proj.weight lr:0.023833333 weight_norm:99.88 grad_norm:4094.71 grad_diff_norm:7247.47 momentum_norm:5516.11 update_norm:21.1675 update_l0_norm:27.3211 relative_update:0.211929 relative_update_l0:0.27354 update_l0_cos:0.920708 update_grad_cos:0.0762128 update_momentum_cos:0.509788 l_trace:1.48206e+08 l_fro:1.41626e+08 l_trace_fraction:0.684094 l_top_eval:1.41623e+08 l_top_eval_fraction:0.95558
+diag step:500 name:blocks.6.mlp.proj.weight lr:0.023833333 weight_norm:97.0965 grad_norm:3718.37 grad_diff_norm:6230.27 momentum_norm:9064.03 update_norm:22.7805 update_l0_norm:27.7128 relative_update:0.234617 relative_update_l0:0.285415 update_l0_cos:0.982007 update_grad_cos:0.234848 update_momentum_cos:0.862985 l_trace:1.28033e+08 l_fro:5.49714e+07 l_trace_fraction:0.537201 l_top_eval:5.19925e+07 l_top_eval_fraction:0.406087
+step:500/1500 val_loss:3.82689 train_time:233.039s step_avg:460.77ms
+diag step:625 name:blocks.0.attn.q.weight lr:0.020857143 weight_norm:90.2609 grad_norm:1067.61 grad_diff_norm:1875.11 momentum_norm:3725.3 update_norm:20.277 update_l0_norm:27.5393 relative_update:0.224649 relative_update_l0:0.305108 update_l0_cos:0.902508 update_grad_cos:0.219579 update_momentum_cos:0.686142 l_trace:1.33815e+07 l_fro:5.94278e+06 l_trace_fraction:0.456646 l_top_eval:5.62799e+06 l_top_eval_fraction:0.420579
+diag step:625 name:blocks.11.attn.proj.weight lr:0.020857143 weight_norm:108.112 grad_norm:2302.64 grad_diff_norm:4267.89 momentum_norm:4533.74 update_norm:21.1567 update_l0_norm:27.4537 relative_update:0.195692 relative_update_l0:0.253938 update_l0_cos:0.919132 update_grad_cos:0.117253 update_momentum_cos:0.593841 l_trace:8.44617e+07 l_fro:7.85488e+07 l_trace_fraction:0.731599 l_top_eval:7.85447e+07 l_top_eval_fraction:0.929944
+diag step:625 name:blocks.6.mlp.proj.weight lr:0.020857143 weight_norm:103.036 grad_norm:2748.51 grad_diff_norm:4430.48 momentum_norm:8978.93 update_norm:22.8585 update_l0_norm:27.7128 relative_update:0.22185 relative_update_l0:0.268962 update_l0_cos:0.983671 update_grad_cos:0.295092 update_momentum_cos:0.875778 l_trace:9.17885e+07 l_fro:3.2225e+07 l_trace_fraction:0.489545 l_top_eval:2.99927e+07 l_top_eval_fraction:0.326759
+step:625/1500 val_loss:3.74014 train_time:290.656s step_avg:460.94ms
+diag step:750 name:blocks.0.attn.q.weight lr:0.017880952 weight_norm:92.7755 grad_norm:1140.02 grad_diff_norm:1788.84 momentum_norm:3672.79 update_norm:20.3173 update_l0_norm:27.5327 relative_update:0.218994 relative_update_l0:0.296767 update_l0_cos:0.903192 update_grad_cos:0.206402 update_momentum_cos:0.690899 l_trace:9.87967e+06 l_fro:3.86136e+06 l_trace_fraction:0.382647 l_top_eval:3.67092e+06 l_top_eval_fraction:0.371563
+diag step:750 name:blocks.11.attn.proj.weight lr:0.017880952 weight_norm:112.877 grad_norm:3067.95 grad_diff_norm:4714.8 momentum_norm:4896.61 update_norm:21.2413 update_l0_norm:27.4089 relative_update:0.188181 relative_update_l0:0.242821 update_l0_cos:0.92396 update_grad_cos:0.0972563 update_momentum_cos:0.574056 l_trace:5.64279e+07 l_fro:5.08195e+07 l_trace_fraction:0.551081 l_top_eval:5.08143e+07 l_top_eval_fraction:0.900517
+diag step:750 name:blocks.6.mlp.proj.weight lr:0.017880952 weight_norm:106.18 grad_norm:3427.02 grad_diff_norm:5524.15 momentum_norm:9531.17 update_norm:23.0243 update_l0_norm:27.7128 relative_update:0.216843 relative_update_l0:0.260999 update_l0_cos:0.984755 update_grad_cos:0.25829 update_momentum_cos:0.868965 l_trace:9.01563e+07 l_fro:3.15778e+07 l_trace_fraction:0.439644 l_top_eval:2.9919e+07 l_top_eval_fraction:0.331857
+step:750/1500 val_loss:3.67843 train_time:348.212s step_avg:460.44ms
+diag step:875 name:blocks.0.attn.q.weight lr:0.014904762 weight_norm:93.8684 grad_norm:1359.28 grad_diff_norm:2048.8 momentum_norm:3748.56 update_norm:20.3497 update_l0_norm:27.539 relative_update:0.21679 relative_update_l0:0.293379 update_l0_cos:0.903128 update_grad_cos:0.188659 update_momentum_cos:0.675672 l_trace:1.0238e+07 l_fro:4.08531e+06 l_trace_fraction:0.361352 l_top_eval:3.81285e+06 l_top_eval_fraction:0.37242
+diag step:875 name:blocks.11.attn.proj.weight lr:0.014904762 weight_norm:115.46 grad_norm:2578.49 grad_diff_norm:4167.81 momentum_norm:4558.32 update_norm:21.236 update_l0_norm:27.4626 relative_update:0.183926 relative_update_l0:0.237854 update_l0_cos:0.922445 update_grad_cos:0.110205 update_momentum_cos:0.619176 l_trace:4.74636e+07 l_fro:4.18077e+07 l_trace_fraction:0.586355 l_top_eval:4.18019e+07 l_top_eval_fraction:0.880716
+diag step:875 name:blocks.6.mlp.proj.weight lr:0.014904762 weight_norm:107.58 grad_norm:3378.17 grad_diff_norm:5538.97 momentum_norm:9663.96 update_norm:23.0384 update_l0_norm:27.7128 relative_update:0.214152 relative_update_l0:0.257603 update_l0_cos:0.985266 update_grad_cos:0.247547 update_momentum_cos:0.875254 l_trace:8.40066e+07 l_fro:2.82403e+07 l_trace_fraction:0.420474 l_top_eval:2.687e+07 l_top_eval_fraction:0.319856
+step:875/1500 val_loss:3.62364 train_time:405.811s step_avg:460.79ms
+diag step:1000 name:blocks.0.attn.q.weight lr:0.011928571 weight_norm:94.0223 grad_norm:998.336 grad_diff_norm:1369.46 momentum_norm:3666.97 update_norm:20.35 update_l0_norm:27.5421 relative_update:0.216438 relative_update_l0:0.292932 update_l0_cos:0.903743 update_grad_cos:0.233001 update_momentum_cos:0.693659 l_trace:7.32463e+06 l_fro:2.23144e+06 l_trace_fraction:0.324081 l_top_eval:2.0678e+06 l_top_eval_fraction:0.282308
+diag step:1000 name:blocks.11.attn.proj.weight lr:0.011928571 weight_norm:116.63 grad_norm:2288.22 grad_diff_norm:3418.74 momentum_norm:4601.52 update_norm:21.2938 update_l0_norm:27.4798 relative_update:0.182576 relative_update_l0:0.235615 update_l0_cos:0.925073 update_grad_cos:0.130541 update_momentum_cos:0.625802 l_trace:3.49242e+07 l_fro:2.96768e+07 l_trace_fraction:0.516462 l_top_eval:2.96709e+07 l_top_eval_fraction:0.849578
+diag step:1000 name:blocks.6.mlp.proj.weight lr:0.011928571 weight_norm:107.8 grad_norm:3077.38 grad_diff_norm:4739.24 momentum_norm:10053.1 update_norm:23.1832 update_l0_norm:27.7128 relative_update:0.215056 relative_update_l0:0.257075 update_l0_cos:0.986749 update_grad_cos:0.287518 update_momentum_cos:0.878812 l_trace:7.12687e+07 l_fro:1.72886e+07 l_trace_fraction:0.373487 l_top_eval:1.52954e+07 l_top_eval_fraction:0.214616
+step:1000/1500 val_loss:3.57510 train_time:463.404s step_avg:460.74ms
+diag step:1125 name:blocks.0.attn.q.weight lr:0.008952381 weight_norm:93.5749 grad_norm:2220.89 grad_diff_norm:2417.28 momentum_norm:4396.81 update_norm:20.3489 update_l0_norm:27.4729 relative_update:0.217461 relative_update_l0:0.293593 update_l0_cos:0.905778 update_grad_cos:0.153956 update_momentum_cos:0.622504 l_trace:1.15447e+07 l_fro:4.60911e+06 l_trace_fraction:0.261305 l_top_eval:3.89587e+06 l_top_eval_fraction:0.337461
+diag step:1125 name:blocks.11.attn.proj.weight lr:0.008952381 weight_norm:116.921 grad_norm:2199.87 grad_diff_norm:2984.26 momentum_norm:4850.14 update_norm:21.2701 update_l0_norm:27.4882 relative_update:0.181919 relative_update_l0:0.235102 update_l0_cos:0.924601 update_grad_cos:0.137234 update_momentum_cos:0.626446 l_trace:3.14326e+07 l_fro:2.55037e+07 l_trace_fraction:0.476382 l_top_eval:2.5494e+07 l_top_eval_fraction:0.81107
+diag step:1125 name:blocks.6.mlp.proj.weight lr:0.008952381 weight_norm:107.286 grad_norm:3401.52 grad_diff_norm:4692.07 momentum_norm:10847.4 update_norm:23.2071 update_l0_norm:27.7128 relative_update:0.21631 relative_update_l0:0.258307 update_l0_cos:0.987061 update_grad_cos:0.271937 update_momentum_cos:0.870672 l_trace:7.43861e+07 l_fro:1.52009e+07 l_trace_fraction:0.344078 l_top_eval:1.1085e+07 l_top_eval_fraction:0.149019
+step:1125/1500 val_loss:3.53590 train_time:520.942s step_avg:460.30ms
+diag step:1250 name:blocks.0.attn.q.weight lr:0.0059761905 weight_norm:92.8361 grad_norm:932.688 grad_diff_norm:1344.77 momentum_norm:4062.27 update_norm:20.4208 update_l0_norm:27.5408 relative_update:0.219966 relative_update_l0:0.296661 update_l0_cos:0.905069 update_grad_cos:0.243345 update_momentum_cos:0.679439 l_trace:6.63376e+06 l_fro:1.73253e+06 l_trace_fraction:0.26582 l_top_eval:1.60688e+06 l_top_eval_fraction:0.242227
+diag step:1250 name:blocks.11.attn.proj.weight lr:0.0059761905 weight_norm:116.681 grad_norm:1854.96 grad_diff_norm:2491.41 momentum_norm:4925.81 update_norm:21.3704 update_l0_norm:27.5076 relative_update:0.183153 relative_update_l0:0.235751 update_l0_cos:0.926109 update_grad_cos:0.14869 update_momentum_cos:0.640143 l_trace:2.10789e+07 l_fro:1.52235e+07 l_trace_fraction:0.403895 l_top_eval:1.52086e+07 l_top_eval_fraction:0.721509
+diag step:1250 name:blocks.6.mlp.proj.weight lr:0.0059761905 weight_norm:106.435 grad_norm:3110.03 grad_diff_norm:4242.08 momentum_norm:11477.1 update_norm:23.3844 update_l0_norm:27.7128 relative_update:0.219706 relative_update_l0:0.260373 update_l0_cos:0.988692 update_grad_cos:0.286486 update_momentum_cos:0.870839 l_trace:5.95373e+07 l_fro:8.2084e+06 l_trace_fraction:0.282561 l_top_eval:5.67192e+06 l_top_eval_fraction:0.0952667
+step:1250/1500 val_loss:3.49895 train_time:578.540s step_avg:460.78ms
+diag step:1375 name:blocks.0.attn.q.weight lr:0.003 weight_norm:92.1449 grad_norm:968.229 grad_diff_norm:1491.31 momentum_norm:4594.23 update_norm:20.4094 update_l0_norm:27.528 relative_update:0.221493 relative_update_l0:0.298747 update_l0_cos:0.903729 update_grad_cos:0.219383 update_momentum_cos:0.651077 l_trace:9.14031e+06 l_fro:2.54895e+06 l_trace_fraction:0.290084 l_top_eval:2.3259e+06 l_top_eval_fraction:0.254466
+diag step:1375 name:blocks.11.attn.proj.weight lr:0.003 weight_norm:116.289 grad_norm:1561.52 grad_diff_norm:2261.31 momentum_norm:6008.34 update_norm:21.3523 update_l0_norm:27.492 relative_update:0.183613 relative_update_l0:0.236411 update_l0_cos:0.925664 update_grad_cos:0.163237 update_momentum_cos:0.572148 l_trace:2.60456e+07 l_fro:1.7622e+07 l_trace_fraction:0.394075 l_top_eval:1.75253e+07 l_top_eval_fraction:0.67287
+diag step:1375 name:blocks.6.mlp.proj.weight lr:0.003 weight_norm:105.638 grad_norm:2940.4 grad_diff_norm:4125.36 momentum_norm:13136.4 update_norm:23.4017 update_l0_norm:27.7128 relative_update:0.221526 relative_update_l0:0.262337 update_l0_cos:0.988378 update_grad_cos:0.294462 update_momentum_cos:0.841387 l_trace:7.34274e+07 l_fro:1.02679e+07 l_trace_fraction:0.279371 l_top_eval:6.35444e+06 l_top_eval_fraction:0.0865404
+step:1375/1500 val_loss:3.46874 train_time:636.094s step_avg:460.44ms
+diag step:1500 name:blocks.0.attn.q.weight lr:2.3809524e-05 weight_norm:91.8238 grad_norm:985.694 grad_diff_norm:1345.91 momentum_norm:5103.83 update_norm:20.7899 update_l0_norm:27.4948 relative_update:0.22641 relative_update_l0:0.29943 update_l0_cos:0.911634 update_grad_cos:0.224892 update_momentum_cos:0.628647 l_trace:5.82014e+06 l_fro:1.13585e+06 l_trace_fraction:0.17103 l_top_eval:982279 l_top_eval_fraction:0.168772
+diag step:1500 name:blocks.11.attn.proj.weight lr:2.3809524e-05 weight_norm:116.087 grad_norm:1554.47 grad_diff_norm:2232.97 momentum_norm:7376.46 update_norm:21.6555 update_l0_norm:27.438 relative_update:0.186545 relative_update_l0:0.236357 update_l0_cos:0.933186 update_grad_cos:0.171201 update_momentum_cos:0.525831 l_trace:1.58302e+07 l_fro:9.40978e+06 l_trace_fraction:0.206102 l_top_eval:9.35727e+06 l_top_eval_fraction:0.591104
+diag step:1500 name:blocks.6.mlp.proj.weight lr:2.3809524e-05 weight_norm:105.272 grad_norm:2967.42 grad_diff_norm:4147.18 momentum_norm:15610.8 update_norm:23.9828 update_l0_norm:27.7128 relative_update:0.227819 relative_update_l0:0.263251 update_l0_cos:0.991292 update_grad_cos:0.293966 update_momentum_cos:0.812781 l_trace:5.62222e+07 l_fro:6.26259e+06 l_trace_fraction:0.174709 l_top_eval:4.88089e+06 l_top_eval_fraction:0.0868144
+step:1500/1500 val_loss:3.45030 train_time:693.628s step_avg:460.27ms

@@ -1,0 +1,39 @@
+{
+  "adam_betas": [
+    0.8,
+    0.95
+  ],
+  "adam_cooldown_frac": 0.7,
+  "adam_eps": 1e-10,
+  "adam_wd": 0.0,
+  "embed_lr": 0.3,
+  "leon_beta2": 0.7,
+  "leon_cooldown_frac": 0.7,
+  "leon_diag_interval": 125,
+  "leon_diag_patterns": [
+    "blocks.0.attn.q.weight",
+    "blocks.6.mlp.proj.weight",
+    "blocks.11.attn.proj.weight"
+  ],
+  "leon_eps": 1e-12,
+  "leon_l_normalize_mode": "off",
+  "leon_l_scale": 1.0,
+  "leon_l_scale_ramp_end_frac": 0.6,
+  "leon_l_scale_ramp_start_frac": 0.2,
+  "leon_l_scale_schedule": "constant",
+  "leon_log_diagnostics": true,
+  "leon_lr": 0.025,
+  "leon_match_l0_norm": false,
+  "leon_mu": 0.95,
+  "leon_ns_iters": 12,
+  "leon_orthogonalize_dtype": "float32",
+  "leon_use_grad_diff": true,
+  "leon_use_nesterov": true,
+  "leon_wd": 0.05,
+  "proj_lr": 0.003125,
+  "scalar_lr": 0.01,
+  "train_steps": 1500,
+  "wandb_mode": "online",
+  "wandb_project": "modded-nanogpt-track3",
+  "wandb_run_name": "gd_wd050_1500"
+}

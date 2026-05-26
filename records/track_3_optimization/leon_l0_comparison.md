@@ -452,3 +452,95 @@ Grad-diff finishes **0.00192 better than L=1 baseline** and is effectively tied 
 ### Summary position
 
 Grad-diff second moment is a mild but consistent improvement over raw-gradient L=1 at no additional memory cost penalty (same buffer sizes; `prev_grad_buffer` adds one parameter-sized float32 tensor). It is the best single-run L=1 variant tested so far that does not explicitly rescale `L` (`match_g` rescales; grad-diff does not). Worth testing at `l_scale=2.0` (which showed the best result for LeonH) to see if the curvature signal in grad-diff `L` benefits from amplification.
+
+---
+
+## 2026-05-24: Grad-diff Hyperparameter Sweep (1500 steps)
+
+One-at-a-time sweep around the baseline `use_grad_diff=True` config (`lr=0.025, wd=0.025, mu=0.95, beta2=0.7`), which achieved 3.43389 at 1500 steps. Shared flags: `leon_ns_iters=12`, `leon_orthogonalize_dtype=float32`, `leon_eps=1e-12`, `leon_cooldown_frac=0.7`, `train_steps=1500`.
+
+### Results
+
+| Run | LR | WD | mu | beta2 | Final val | vs baseline |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline (ref) | 0.025 | 0.025 | 0.95 | 0.7 | 3.43389 | +0.00000 |
+| gd_lr0175_1500 | **0.0175** | 0.025 | 0.95 | 0.7 | 3.44406 | +0.01017 |
+| gd_lr035_1500 | **0.035** | 0.025 | 0.95 | 0.7 | 3.43521 | +0.00132 |
+| gd_wd0125_1500 | 0.025 | **0.0125** | 0.95 | 0.7 | 3.44483 | +0.01094 |
+| **gd_wd050_1500** | 0.025 | **0.05** | 0.95 | 0.7 | **3.43335** | **−0.00054** |
+| gd_mu085_1500 | 0.025 | 0.025 | **0.85** | 0.7 | 3.47138 | +0.03749 |
+| gd_mu098_1500 | 0.025 | 0.025 | **0.98** | 0.7 | 3.45030 | +0.01641 |
+| **gd_b250_1500** | 0.025 | 0.025 | 0.95 | **0.5** | **3.43343** | **−0.00046** |
+| gd_b290_1500 | 0.025 | 0.025 | 0.95 | **0.9** | 3.44626 | +0.01237 |
+
+### Findings
+
+1. **Baseline hyperparameters are near-optimal.** All 8 perturbed runs either match or regress vs. the baseline. The two marginal improvements (`wd=0.05` at −0.00054 and `beta2=0.5` at −0.00046) are sub-noise (< 0.001); neither warrants follow-up.
+
+2. **Momentum (mu) is the most sensitive knob.** Both mu=0.85 (+0.037) and mu=0.98 (+0.016) hurt substantially. The grad-diff second moment relies on coherent gradient differences; weaker momentum (0.85) destabilizes these differences, while very high momentum (0.98) slows the first-moment update that drives the differences.
+
+3. **Lower LR and lower WD both hurt.** lr=0.0175 (+0.010) and wd=0.0125 (+0.011) are clear regressions. Higher wd=0.05 is essentially neutral (−0.00054), suggesting mild regularization helps but the effect is tiny.
+
+4. **Grad-diff remains ~0.002 behind L=0 (3.43230).** Sweeping hyperparameters does not close the gap. The bottleneck is the L-direction rotation effect (cos ~0.89), not the learning rate or momentum tuning.
+
+### Conclusion
+
+The baseline `lr=0.025, wd=0.025, mu=0.95, beta2=0.7` is the practical optimum for the grad-diff variant at 1500 steps. No single hyperparameter change yields a meaningful gain. The next experiment is the no-Nesterov variant (`leon_use_nesterov=False`), which controls for the contribution of the first-moment buffer.
+
+---
+
+## 2026-05-24: No-Nesterov Variant (use_nesterov=False)
+
+Control experiment: `leon_use_nesterov=False, leon_use_grad_diff=False`. The optimizer reduces to `update = (GG^T + L)^{-0.5} G` — raw gradient preconditioned by the augmented Gram matrix, no first-moment buffer. Settings otherwise identical to the baseline: `lr=0.025, wd=0.025, beta2=0.7, ns_iters=12, float32, eps=1e-12, cooldown_frac=0.7, train_steps=1500`.
+
+Run directory: `records/track_3_optimization/runs/leon/20260524-191011-469ba597`
+
+### Val trajectory vs. Nesterov variants
+
+| Step | L=0 (Nesterov) | L=1 (Nesterov) | grad-diff (Nesterov) | **No-Nesterov** |
+| ---: | ---: | ---: | ---: | ---: |
+| 125 | 4.79942 | 5.03116 | ~4.92 | 4.93118 |
+| 250 | 4.19596 | 4.51157 | ~4.43 | 4.42181 |
+| 375 | 3.98429 | 4.18429 | ~4.07 | 4.18464 |
+| 500 | 3.85956 | 4.02075 | ~3.88 | 4.05503 |
+| 750 | 3.69533 | 3.83791 | ~3.72 | 3.87832 |
+| 1000 | 3.58368 | 3.71337 | ~3.62 | 3.75674 |
+| 1250 | 3.48187 | 3.67185 | ~3.55 | 3.67185 |
+| 1500 | 3.43230 | 3.43581 | 3.43389 | **3.62775** |
+
+### Diagnostic snapshot (blocks.0.attn.q.weight)
+
+| Step | ‖U‖/‖W‖ | ‖U₀‖/‖W‖ | cos(U, U₀) | tr(L) frac | cos(U, grad) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 125 | 0.782 | 1.892 | 0.842 | 0.730 | 0.265 |
+| 250 | 0.844 | 2.091 | 0.833 | 0.737 | 0.395 |
+| 375 | 0.900 | 2.211 | 0.834 | 0.762 | 0.450 |
+| 750 | 0.981 | 2.476 | 0.831 | 0.792 | 0.542 |
+| 1500 | 1.113 | 2.772 | 0.837 | 0.769 | 0.701 |
+
+For reference, Nesterov L=1 at step 1500: ‖U‖/‖W‖=0.374, tr_frac=0.193, cos(U,grad)=0.263.
+
+### Findings
+
+1. **Nesterov is the dominant contributor.** Removing the first-moment buffer increases final val by **+0.194** (3.62775 vs 3.43389), dwarfing any effect we've measured from L variants (max ±0.004 range). This is the largest regression of any experiment in this series.
+
+2. **L completely dominates without Nesterov.** tr_frac stays in the 0.73–0.79 range throughout, compared to 0.19–0.43 for Nesterov L=1. Without the accumulated gradient signal in the first moment, the raw per-step gradient has low SNR, so the Gram matrix `GG^T` is small relative to the EMA `L` buffer and the preconditioner is almost purely driven by `L`.
+
+3. **‖U‖/‖W‖ grows above 1.0 late in training.** The relative update size is actually larger than for any Nesterov variant (~1.1 vs ~0.38 at step 1500). Despite this, the model trains worse. The raw gradient direction is noisy compared to the Nesterov-smoothed direction — a larger step in a noisier direction does not help.
+
+4. **cos(U, grad) climbs to 0.70 by step 1500.** This is mathematically expected: without momentum, the NS update is just `(GG^T+L)^{-0.5} G`, which converges toward the gradient direction as `L` grows. The increasing alignment confirms the optimizer is computing something close to a scaled raw gradient — losing the curvature-following benefit of Nesterov.
+
+5. **Early val is comparable, late val diverges.** At step 375 no-Nesterov (4.184) nearly matches L=1 Nesterov (4.184). The divergence emerges in the cooldown phase. Nesterov momentum accumulates signal across steps and benefits disproportionately during cooldown when the LR drops; without it, the optimizer cannot exploit the accumulated trajectory.
+
+### Conclusion
+
+Nesterov momentum is the load-bearing component of Leon — not `L` and not the NS orthogonalization alone. The full ablation hierarchy, from best to worst at 1500 steps:
+
+| Config | Final val | Role removed |
+| --- | ---: | --- |
+| L=0 (Nesterov, no L) | 3.43230 | L term |
+| grad-diff L=1 | 3.43389 | raw-grad L → curvature L |
+| L=1 Nesterov | 3.43581 | — (baseline) |
+| No-Nesterov, L=1 | 3.62775 | First-moment buffer |
+
+The L term itself matters little (~0.003 cost over L=0) but the first-moment buffer matters enormously (~0.19 cost without it).
