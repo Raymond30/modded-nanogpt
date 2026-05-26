@@ -1,0 +1,27 @@
+{
+  "argv": [
+    "records/track_3_optimization/train_gpt_simple_normuon.py",
+    "--set",
+    "use_normuon=True",
+    "--set",
+    "train_steps=1500",
+    "--set",
+    "wandb_project=modded-nanogpt-track3",
+    "--set",
+    "wandb_run_name=normuon_nm_lr025_1500"
+  ],
+  "cuda_version": "12.8",
+  "cwd": "/mnt/nas/rj23424/modded-nanogpt",
+  "device_name": "NVIDIA H100 NVL",
+  "dry_run": false,
+  "git_commit": "7dafe663c8a469d3120fa57724e25d7026376ce5",
+  "mode": "train",
+  "out_dir": "records/track_3_optimization/runs/normuon/20260526-164608-212eccd4",
+  "script": "records/track_3_optimization/train_gpt_simple_normuon.py",
+  "shard_counts": {
+    "train_shards": 103,
+    "val_shards": 1
+  },
+  "torch_version": "2.11.0+cu128",
+  "world_size": 4
+}

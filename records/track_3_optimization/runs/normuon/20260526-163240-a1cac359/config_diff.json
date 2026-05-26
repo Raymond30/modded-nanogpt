@@ -1,0 +1,6 @@
+{
+  "train_steps": 1500,
+  "use_normuon": false,
+  "wandb_project": "modded-nanogpt-track3",
+  "wandb_run_name": "normuon_muon_ctrl_1500"
+}

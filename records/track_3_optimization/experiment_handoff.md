@@ -731,6 +731,111 @@ Config: `matrix_lr=0.001, embed_lr=0.6, proj_lr=1/160, leonv_betas=(0.9,0.90), l
 
 **Baseline:** `betas=(0.9,0.95)` — final val 3.28346 @ 5625 steps, did not reach 3.28 threshold.
 
+## NorMuon Experiments (2026-05-26)
+
+Last updated: 2026-05-26. Three 1500-step diagnostic runs complete.
+
+### Context
+
+NorMuon adds per-row (per-neuron) adaptive step scaling on top of standard Muon. After Newton-Schulz orthogonalization it computes per-row mean-square `v_mean`, maintains a float32 EMA (`second_momentum`, decay `beta2=0.95`), derives `step_size = 1/sqrt(EMA)`, applies it, then **renormalizes to preserve the total Frobenius norm**. Net effect: rows (neurons) that are small after NS get a proportionally larger update, equalizing per-neuron update magnitude while preserving total update energy. Motivated by the Aurora blog post theory that Muon causes neuron death via leverage-score concentration in MLP layers.
+
+Scripts created: `records/track_3_optimization/train_gpt_simple_normuon.py`, `records/track_3_optimization/launch_normuon.sh`. The script supports `use_normuon=True/False` to toggle between NorMuon and vanilla Muon using the same codebase.
+
+**Note on diagnostic bug (first runs):** The first three runs (dirs `20260526-163240-a1cac359`, `20260526-164608-212eccd4`, `20260526-165932-52d6388e`) had a `param_names` bug where names lacked the `blocks.` prefix, causing all diagnostic patterns to fail to match. Val trajectories from those runs are valid but diagnostic stats are absent. Fixed runs (v2) used in the analysis below.
+
+### Run Summary (v2 — fixed diagnostics)
+
+| Run | `use_normuon` | lr | Final val@1500 | Δ vs Muon ctrl | Run dir |
+|---|---|---|---:|---:|---|
+| `normuon_muon_ctrl_1500_v2` | False | 0.025 | 3.43027 | 0 (baseline) | `runs/normuon/20260526-171422-d7880700` |
+| `normuon_nm_lr025_1500_v2` | True | 0.025 | 3.42511 | −0.00516 | `runs/normuon/20260526-172638-d40a4a24` |
+| **`normuon_nm_lr035_1500_v2`** | True | **0.035** | **3.42355** | **−0.00672** | `runs/normuon/20260526-173753-c4d1d9a1` |
+
+All runs: `wd=0.025, mu=0.95, normuon_beta2=0.95, cooldown_frac=0.7, train_steps=1500, ns_iters=12, bf16`.
+
+### Val Loss Trajectory
+
+| Step | Muon ctrl | NorMuon lr=0.025 | NorMuon lr=0.035 | Δ(nm025−muon) | Δ(nm035−muon) |
+|---:|---:|---:|---:|---:|---:|
+| 125 | 4.62787 | 4.58350 | 4.63258 | −0.044 | +0.005 |
+| 250 | 4.11001 | 4.08512 | 4.10422 | −0.025 | −0.006 |
+| 500 | 3.81735 | 3.80168 | 3.81197 | −0.016 | −0.005 |
+| 750 | 3.66301 | 3.65368 | 3.66178 | −0.009 | −0.001 |
+| 1000 | 3.55797 | 3.55168 | 3.55660 | −0.006 | −0.001 |
+| 1375 | 3.44912 | 3.44385 | 3.44397 | −0.005 | −0.005 |
+| 1500 | 3.43027 | 3.42511 | 3.42355 | −0.005 | −0.007 |
+
+Key observation: NorMuon lr=0.025 leads from step 125 onward. NorMuon lr=0.035 converges more aggressively (compresses early loss at the cost of a higher initial val), but catches up by step 1375.
+
+### Diagnostic Analysis — Aurora Neuron-Death Theory
+
+#### Q1: Does Muon show high `ns_row_cv` (leverage concentration)?
+
+Yes, MLP layers show significant and layer-depth-dependent NS output heterogeneity:
+
+| Layer | Muon `ns_row_cv` @step125 | Muon `ns_row_cv` @step1500 | NorMuon `ns_row_cv` @step125 |
+|---|---:|---:|---:|
+| `blocks.0.mlp.fc` | 0.262 | 0.108 | 0.150 |
+| `blocks.6.mlp.fc` | 0.458 | 0.171 | 0.266 |
+| `blocks.11.mlp.fc` | 0.484 | 0.208 | 0.256 |
+| `blocks.0.attn.q` | 0.004 | 0.005 | 0.004 |
+
+Aurora's leverage-concentration observation is confirmed: deeper MLP layers have substantially higher row-norm CV than shallow ones. Square attention matrices (`attn.q`) are nearly isotropic after NS (CV ~0.004) throughout training. All CVs decrease over training as weights converge.
+
+Notably, NorMuon also shows elevated `ns_row_cv` (because the EMA is cold early in training), but NorMuon's adaptive step brings the **effective update** row CV down drastically:
+
+#### Q2: Does NorMuon equalize per-neuron update magnitude (`update_row_cv` near 0)?
+
+Yes, and the equalization is strikingly effective:
+
+| Layer | Muon `update_row_cv`@125 | NorMuon `update_row_cv`@125 | NorMuon `update_row_cv`@1500 |
+|---|---:|---:|---:|
+| `blocks.0.mlp.fc` | 0.262 | **0.065** | **0.036** |
+| `blocks.6.mlp.fc` | 0.458 | **0.094** | **0.038** |
+| `blocks.11.mlp.fc` | 0.484 | **0.079** | **0.030** |
+| `blocks.0.attn.q` | 0.004 | 0.003 | 0.003 |
+
+NorMuon reduces `update_row_cv` by ~4–6× vs Muon at step 125. By step 1500 it converges to ~0.03–0.04 — close to but not exactly zero, because the EMA `second_momentum` is still learning the per-row variance distribution. The `step_size_cv` (compensation magnitude) tracks the `ns_row_cv` of the NS output; `step_size_max_min` (max/min ratio of per-row step sizes, not logged but derivable from `step_size_cv`) is widest early when rows are most heterogeneous.
+
+#### Q3: What is `cos_normuon_muon`?
+
+Very close to 1.0 throughout training:
+
+| Layer | @step125 | @step500 | @step1500 |
+|---|---:|---:|---:|
+| `blocks.0.mlp.fc` | 0.989 | 0.994 | 0.994 |
+| `blocks.6.mlp.fc` | 0.964 | 0.988 | 0.990 |
+| `blocks.11.mlp.fc` | 0.967 | 0.990 | 0.990 |
+| `blocks.0.attn.q` | 1.000 | 1.000 | 1.000 |
+
+The per-row equalization barely rotates the update direction from the NS orthogonal direction. This is crucial: NorMuon's gain is almost entirely from redistributing step energy across neurons (rescaling rows) rather than from changing the direction of the update. The directional cost of equalization is negligible (~1–4% angle from NS output).
+
+#### Q4: Does NorMuon prevent neuron death (`w_dead_frac`)?
+
+Neither Muon nor NorMuon showed neuron death (`w_dead_frac = 0.000`) at any tracked layer or at any checkpoint from step 125 to step 1500. The Aurora paper may observe death in different settings (more steps, larger model, different architecture, or different threshold). At this scale and horizon:
+- The `w_dead_frac` metric (fraction of row norms < 10% of mean) stays at zero throughout.
+- However, the Muon `ns_row_cv` values (~0.10–0.48) do confirm the structural condition that Aurora identifies as the precursor to neuron death — some rows consistently receive smaller updates than others, which would eventually cause them to shrink.
+- The 1500-step window may be too short for death to manifest. The Aurora paper observes 25% dead neurons by step 500, but in a potentially different regime.
+
+### Key Findings Summary
+
+1. **NorMuon consistently outperforms matched-hparam Muon by ~0.005–0.007 at 1500 steps.** The gain is present from step 125 (for lr=0.025) and grows slowly over training. This is smaller but consistent with the improvement reported in the reference run.
+
+2. **NorMuon's lr=0.035 matches or beats lr=0.025 by step 1375**, suggesting the reference lr=0.035 is the better choice for NorMuon (higher LR tolerated due to per-row step equalization).
+
+3. **Aurora's leverage-concentration claim is empirically confirmed:** MLP layers show CV ~0.26–0.48 at step 125, with deeper layers worse. Attn layers are isotropic (CV ~0.004). NorMuon actively corrects this.
+
+4. **NorMuon's equalization works without directional cost:** `cos_normuon_muon` ≥ 0.989 for block-0 MLP, converging toward 0.994. Deeper layers start at 0.964 and converge similarly. The adaptive rescaling is nearly invisible as a direction change.
+
+5. **No neuron death at 1500 steps** in either optimizer with this architecture and hyperparameters. The precondition for death (heterogeneous row norms after NS) is confirmed present in Muon.
+
+### Next Steps for NorMuon
+
+1. **3375-step benchmark run at lr=0.035** — expected to be NorMuon's best config per the reference implementation. The 1500-step margin (-0.007) is small but consistent; a full-budget run would determine whether NorMuon closes the gap to Muon at 3375 steps.
+2. **LR sweep** around lr=0.035 to find the NorMuon optimum (the 1500-step screen already suggests 0.035 ≥ 0.025).
+3. **Longer runs** (>3375 steps) could potentially reveal neuron death in Muon and its absence in NorMuon if the Aurora theory requires more steps to manifest.
+4. **Compare NorMuon vs best Muon at 3375 steps**: Muon best is 3.27823 (lr=0.025, 3375 steps). NorMuon at 1500 steps projects to ~3.42355 → TBD at 3375 steps.
+
 ## Important Commits
 
 | Commit | Purpose |

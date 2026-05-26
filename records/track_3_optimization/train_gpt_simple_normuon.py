@@ -1,0 +1,876 @@
+"""
+train_gpt_simple_normuon.py
+
+NorMuon optimizer experiment script with neuron-death diagnostics.
+Supports vanilla Muon (use_normuon=False) and NorMuon (use_normuon=True) via
+the same script for clean paired comparison.
+
+NorMuon adds per-row (per-neuron) adaptive step sizing after Newton-Schulz
+orthogonalization to prevent leverage-score concentration (neuron death):
+  Reference: records/track_3_optimization/results/20260503_normuon/
+  Theory: https://blog.tilderesearch.com/blog/aurora
+
+Diagnostics capture per-neuron update statistics every diag_interval steps
+to test the Aurora claim that Muon causes leverage-score concentration in MLP
+layers and that NorMuon mitigates it.
+"""
+
+import math
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read()  # read source ASAP for logging
+import argparse
+import ast
+import json
+import subprocess
+import uuid
+import time
+from datetime import datetime
+from pathlib import Path
+
+
+########################################
+#         Hparams & CLI Setup          #
+########################################
+
+BASE_HPARAMS = dict(
+    # Optimizer selection: True = NorMuon, False = vanilla Muon (control)
+    use_normuon     = True,
+    # Core optimizer
+    lr              = 0.025,
+    wd              = 0.025,
+    mu              = 0.95,
+    normuon_beta2   = 0.95,   # EMA decay for per-row variance (NorMuon only)
+    cooldown_frac   = 0.7,
+    train_steps     = 3375,
+    # Diagnostic logging
+    log_diagnostics = True,
+    diag_interval   = 125,
+    diag_patterns   = (
+        "blocks.0.mlp.fc.weight",    # MLP layer 0 — primary Aurora focus
+        "blocks.6.mlp.fc.weight",    # MLP layer 6
+        "blocks.11.mlp.fc.weight",   # MLP layer 11
+        "blocks.0.attn.q.weight",    # Attention (square, control)
+    ),
+    # wandb (off by default)
+    wandb_project   = None,
+    wandb_mode      = "online",
+    wandb_run_name  = None,
+)
+
+
+def parse_value(s):
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError):
+        return s
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--out-dir", type=Path, default=None)
+    return parser.parse_args()
+
+
+def resolve_hparams(overrides):
+    hparams = dict(BASE_HPARAMS)
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"--set expects KEY=VALUE, got {item!r}")
+        key, raw = item.split("=", 1)
+        hparams[key] = parse_value(raw)
+    return hparams
+
+
+def config_diff(hparams):
+    return {k: v for k, v in hparams.items() if BASE_HPARAMS.get(k) != v}
+
+
+def default_run_dir():
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path("records/track_3_optimization/runs/normuon") / f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def create_run_dir(out_dir=None):
+    run_dir = Path(out_dir) if out_dir is not None else default_run_dir()
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def git_commit():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return None
+
+
+def shard_counts():
+    cwd = Path.cwd()
+    return dict(
+        train_shards=len(list(cwd.glob("data/fineweb10B/fineweb_train_*.bin"))),
+        val_shards=len(list(cwd.glob("data/fineweb10B/fineweb_val_*.bin"))),
+    )
+
+
+def torch_versions():
+    m = globals().get("torch")
+    if m is None:
+        return None, None
+    return m.version.__version__, m.version.cuda
+
+
+def write_run_files(run_dir, args, hparams, mode, extra=None):
+    tv, cv = torch_versions()
+    diff = config_diff(hparams)
+    metadata = dict(
+        mode=mode,
+        argv=sys.argv,
+        cwd=str(Path.cwd()),
+        script=sys.argv[0],
+        dry_run=args.dry_run,
+        out_dir=str(run_dir),
+        git_commit=git_commit(),
+        torch_version=tv,
+        cuda_version=cv,
+        shard_counts=shard_counts(),
+    )
+    if extra:
+        metadata.update(extra)
+    (run_dir / "config.json").write_text(
+        json.dumps(hparams, indent=2, sort_keys=True, default=list) + "\n")
+    (run_dir / "config_diff.json").write_text(
+        json.dumps(diff, indent=2, sort_keys=True, default=list) + "\n")
+    (run_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True, default=list) + "\n")
+
+
+# Dry-run path: resolve config, write files, exit without CUDA.
+# IMPORTANT: never reuse a dry-run --out-dir for the real torchrun launch.
+# create_run_dir uses exist_ok=False; a leftover dry-run directory will cause
+# the real torchrun to fail after distributed init without writing train.log.
+if "--dry-run" in sys.argv:
+    args = parse_args()
+    hparams = resolve_hparams(args.set)
+    run_dir = create_run_dir(args.out_dir)
+    write_run_files(run_dir, args, hparams, "dry-run")
+    print(f"dry_run:true out_dir:{run_dir}")
+    print(json.dumps(
+        dict(hparams=hparams, config_diff=config_diff(hparams)),
+        indent=2, sort_keys=True, default=list))
+    sys.exit(0)
+
+import torch
+from torch import Tensor, nn
+from torch.optim import AdamW
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+########################################
+#              Dataloader              #
+########################################
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32)
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2])
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy())
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % dist.get_world_size() == 0
+    local_batch_size = batch_size // dist.get_world_size()
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        pos += batch_size
+        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
+
+
+########################################
+#             Architecture             #
+########################################
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        self.register_buffer("angular_freq", torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
+
+    def forward(self, x_BTHD: Tensor):
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
+        theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
+        cos, sin = theta.cos(), theta.sin()
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim=128):
+        super().__init__()
+        self.num_heads = dim // head_dim
+        self.head_dim = head_dim
+        hdim = self.num_heads * self.head_dim
+        self.q = Linear(dim, hdim)
+        self.k = Linear(dim, hdim)
+        self.v = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+        self.rotary = Rotary(head_dim)
+
+    def forward(self, x: Tensor):
+        B, T = x.size(0), x.size(1)
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        q, k = self.rotary(q), self.rotary(k)
+        y = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            scale=0.12, is_causal=True).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        return self.proj(y)
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.fc = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+
+    def forward(self, x: Tensor):
+        x = self.fc(x)
+        x = x.relu().square()
+        return self.proj(x)
+
+class Block(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim)
+        self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+    def forward(self, x: Tensor):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
+        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
+        self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
+
+    def forward(self, inputs: Tensor, targets: Tensor):
+        x = self.norm1(self.embed(inputs))
+        for block in self.blocks:
+            x = block(x)
+        logits = self.proj(self.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+
+
+########################################
+#              Optimizer               #
+########################################
+
+def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+    assert G.ndim >= 2
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    a, b, c = 2, -1.5, 0.5
+    for _ in range(12):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+def _zeropower_float32(G: Tensor) -> Tensor:
+    """NS in float32, uncompiled — used only in diagnostic_stats."""
+    assert G.ndim >= 2
+    X = G.float()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    a, b, c = 2.0, -1.5, 0.5
+    for _ in range(12):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+def _row_stats(x: Tensor, is_tall: bool):
+    """Per-neuron norms: row norms for tall matrices, col norms for wide."""
+    if is_tall:
+        return x.norm(dim=-1)   # shape [D1]
+    else:
+        return x.norm(dim=-2)   # shape [D2]  (per-column, Aurora's "neuron" dim for wide)
+
+
+def _cv(x: Tensor) -> float:
+    return (x.std() / x.mean().clamp_min(1e-12)).item()
+
+
+def _dead_frac(x: Tensor, threshold_frac: float = 0.1) -> float:
+    t = threshold_frac * x.mean().item()
+    return (x < t).float().mean().item()
+
+
+# ---------------------------------------------------------------------------
+# Vanilla Muon
+# ---------------------------------------------------------------------------
+
+@torch.compile
+def muon_update(grad, momentum, mu=0.95, nesterov=True):
+    momentum.lerp_(grad, 1 - mu)
+    update = grad.lerp_(momentum, mu) if nesterov else momentum
+    update = zeropower_via_newtonschulz5(update)
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return update
+
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+        assert isinstance(params, list) and len(params) >= 1
+        assert isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        super().__init__(params, defaults)
+        self.param_names = {}  # id(p) -> name, populated by caller
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum"] = torch.zeros_like(p)
+                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+    def diagnostic_stats(self, selected_patterns):
+        """Compute per-neuron neuron-death metrics for all matching params owned by this rank.
+
+        Returns a list of dicts (one per matched param). NorMuon-specific keys
+        (step_size_cv, step_size_max_min, cos_normuon_muon) are set to nan.
+        """
+        if isinstance(selected_patterns, str):
+            selected_patterns = (selected_patterns,)
+        selected_patterns = tuple(selected_patterns)
+
+        rows = []
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        with torch.no_grad():
+            for group in self.param_groups:
+                params = group["params"]
+                for base_i in range(0, len(params), world_size):
+                    if base_i + rank >= len(params):
+                        continue
+                    p = params[base_i + rank]
+                    name = self.param_names.get(id(p), f"param_{id(p)}")
+                    if selected_patterns and not any(pat in name for pat in selected_patterns):
+                        continue
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if not state:
+                        continue
+
+                    mu = group["mu"]
+                    is_tall = p.size(-2) >= p.size(-1)
+                    G = p.grad.float()
+                    W = p.data.float()
+                    momentum = state["momentum"].float()
+
+                    # Simulate Nesterov estimate without modifying state
+                    mom_new = momentum.lerp(G, 1 - mu)
+                    nesterov_est = G.lerp(mom_new, mu)
+
+                    # NS in float32 for clean diagnostics
+                    U_muon = _zeropower_float32(nesterov_est)
+                    U_muon = U_muon * max(1, G.size(-2) / G.size(-1))**0.5
+
+                    ns_norms = _row_stats(U_muon, is_tall)
+                    g_norms  = _row_stats(G, is_tall)
+                    w_norms  = _row_stats(W, is_tall)
+
+                    rel_update = (U_muon.norm() / W.norm().clamp_min(1e-12)).item()
+
+                    rows.append(dict(
+                        name=name,
+                        g_row_cv=_cv(g_norms),
+                        g_dead_frac=_dead_frac(g_norms),
+                        ns_row_cv=_cv(ns_norms),
+                        ns_dead_frac=_dead_frac(ns_norms),
+                        update_row_cv=_cv(ns_norms),    # for Muon, update ∝ NS output
+                        step_size_cv=float("nan"),       # NorMuon only
+                        step_size_max_min=float("nan"),  # NorMuon only
+                        cos_normuon_muon=float("nan"),   # NorMuon only
+                        w_row_cv=_cv(w_norms),
+                        w_dead_frac=_dead_frac(w_norms),
+                        rel_update=rel_update,
+                    ))
+
+        return rows
+
+
+# ---------------------------------------------------------------------------
+# NorMuon
+# ---------------------------------------------------------------------------
+
+@torch.compile
+def normuon_update(grad, momentum, second_momentum, mu=0.95, beta2=0.95, nesterov=True):
+    momentum.lerp_(grad, 1 - mu)
+    update = grad.lerp_(momentum, mu) if nesterov else momentum
+    update = zeropower_via_newtonschulz5(update)
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+
+    norm = update.norm(dim=(-2, -1), keepdim=True)
+    if grad.size(-2) >= grad.size(-1):
+        v_mean = torch.mean(update * update, dim=-1, keepdim=True)
+    else:
+        v_mean = torch.mean(update * update, dim=-2, keepdim=True)
+    second_momentum.lerp_(v_mean.float(), 1 - beta2)
+    step_size = second_momentum.clamp_min(1e-10).rsqrt().bfloat16()
+
+    update.mul_(step_size)
+    norm_new = update.norm(dim=(-2, -1), keepdim=True)
+    update.mul_(norm / norm_new.clamp_min(1e-10))
+
+    return update
+
+
+class NorMuon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, beta2=0.95):
+        assert isinstance(params, list) and len(params) >= 1
+        assert isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, beta2=beta2)
+        super().__init__(params, defaults)
+        self.param_names = {}  # id(p) -> name, populated by caller
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum"] = torch.zeros_like(p)
+                        if p.size(-2) >= p.size(-1):
+                            state["second_momentum"] = torch.zeros_like(p.data[..., 0:1])
+                        else:
+                            state["second_momentum"] = torch.zeros_like(p.data[0:1, ...])
+                    update = normuon_update(
+                        p.grad, state["momentum"], state["second_momentum"],
+                        mu=group["mu"], beta2=group["beta2"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+    def diagnostic_stats(self, selected_patterns):
+        """Compute per-neuron neuron-death + NorMuon-specific metrics.
+
+        Returns list of dicts. All diagnostics run in float32 on cloned state;
+        optimizer state is not modified. Diagnostic NS uses float32 (training
+        uses bfloat16) — distributions are qualitatively equivalent.
+        """
+        if isinstance(selected_patterns, str):
+            selected_patterns = (selected_patterns,)
+        selected_patterns = tuple(selected_patterns)
+
+        rows = []
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        with torch.no_grad():
+            for group in self.param_groups:
+                params = group["params"]
+                for base_i in range(0, len(params), world_size):
+                    if base_i + rank >= len(params):
+                        continue
+                    p = params[base_i + rank]
+                    name = self.param_names.get(id(p), f"param_{id(p)}")
+                    if selected_patterns and not any(pat in name for pat in selected_patterns):
+                        continue
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if not state:
+                        continue
+
+                    mu = group["mu"]
+                    beta2 = group["beta2"]
+                    is_tall = p.size(-2) >= p.size(-1)
+
+                    G = p.grad.float()
+                    W = p.data.float()
+                    momentum = state["momentum"].float()
+                    sec_mom = state["second_momentum"].float()  # [D1,1] or [1,D2]
+
+                    # Nesterov estimate (read-only clone)
+                    mom_new = momentum.lerp(G, 1 - mu)
+                    nesterov_est = G.lerp(mom_new, mu)
+
+                    # Muon update direction (float32 NS for clean diagnostics)
+                    U_muon = _zeropower_float32(nesterov_est)
+                    U_muon = U_muon * max(1, G.size(-2) / G.size(-1))**0.5
+
+                    # Per-row/col v_mean and projected step_size
+                    if is_tall:
+                        v_mean = (U_muon * U_muon).mean(dim=-1, keepdim=True)  # [D1,1]
+                    else:
+                        v_mean = (U_muon * U_muon).mean(dim=-2, keepdim=True)  # [1,D2]
+                    sec_mom_new = sec_mom.lerp(v_mean, 1 - beta2)
+                    step_size_2d = sec_mom_new.clamp_min(1e-10).rsqrt()  # [D1,1] or [1,D2]
+
+                    # NorMuon update direction
+                    U_normuon_pre = U_muon * step_size_2d  # broadcast
+                    norm_before = U_muon.norm()
+                    norm_after = U_normuon_pre.norm().clamp_min(1e-10)
+                    U_normuon = U_normuon_pre * (norm_before / norm_after)
+
+                    # Flatten step_size for scalar stats
+                    if is_tall:
+                        step_size_1d = step_size_2d.squeeze(-1)    # [D1]
+                    else:
+                        step_size_1d = step_size_2d.squeeze(-2)    # [D2]
+
+                    ns_norms     = _row_stats(U_muon, is_tall)
+                    nm_norms     = _row_stats(U_normuon, is_tall)
+                    g_norms      = _row_stats(G, is_tall)
+                    w_norms      = _row_stats(W, is_tall)
+
+                    cos_num   = (U_normuon.flatten() @ U_muon.flatten()).item()
+                    cos_denom = (U_normuon.norm() * U_muon.norm()).clamp_min(1e-12).item()
+                    cos_nm    = cos_num / cos_denom
+
+                    rel_update = (U_normuon.norm() / W.norm().clamp_min(1e-12)).item()
+
+                    ss_max = step_size_1d.max().item()
+                    ss_min = step_size_1d.clamp_min(1e-12).min().item()
+
+                    rows.append(dict(
+                        name=name,
+                        g_row_cv=_cv(g_norms),
+                        g_dead_frac=_dead_frac(g_norms),
+                        ns_row_cv=_cv(ns_norms),
+                        ns_dead_frac=_dead_frac(ns_norms),
+                        update_row_cv=_cv(nm_norms),
+                        step_size_cv=_cv(step_size_1d),
+                        step_size_max_min=ss_max / ss_min,
+                        cos_normuon_muon=cos_nm,
+                        w_row_cv=_cv(w_norms),
+                        w_dead_frac=_dead_frac(w_norms),
+                        rel_update=rel_update,
+                    ))
+
+        return rows
+
+
+########################################
+#                Main                  #
+########################################
+
+def main():
+    args = parse_args()
+    hparams = resolve_hparams(args.set)
+
+    # torchrun sets these env variables
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    dist.barrier()
+    assert 8 % dist.get_world_size() == 0
+
+    try:
+        if dist.get_rank() == 0:
+            run_dir = create_run_dir(args.out_dir)
+        else:
+            run_dir = None
+        run_dir_obj = [str(run_dir) if run_dir is not None else None]
+        dist.broadcast_object_list(run_dir_obj, src=0)
+        run_dir = Path(run_dir_obj[0])
+        logfile = run_dir / "train.log"
+
+        if dist.get_rank() == 0:
+            print(logfile)
+            write_run_files(run_dir, args, hparams, "train", dict(
+                device_name=torch.cuda.get_device_name(device),
+                world_size=dist.get_world_size(),
+            ))
+
+        wandb_run = None
+        if hparams["wandb_project"] is not None and dist.get_rank() == 0:
+            try:
+                import wandb
+                wandb_run = wandb.init(
+                    project=hparams["wandb_project"],
+                    mode=hparams.get("wandb_mode", "online"),
+                    name=hparams.get("wandb_run_name") or run_dir.name,
+                    dir=str(run_dir),
+                    config=hparams,
+                    tags=[Path(__file__).stem, f"world_size={dist.get_world_size()}"],
+                )
+            except Exception as e:
+                print(f"[wandb] init failed, continuing without wandb: {e}")
+                wandb_run = None
+
+        def print0(s, console=False, log=True):
+            if dist.get_rank() == 0:
+                if console:
+                    print(s)
+                if log:
+                    with open(logfile, "a") as f:
+                        print(s, file=f)
+
+        print0(code)
+        print0("=" * 100)
+        print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+               + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
+        print0(json.dumps(dict(hparams=hparams, config_diff=config_diff(hparams)),
+                          indent=2, sort_keys=True, default=list))
+        print0("=" * 100)
+
+        val_tokens = 20 * 524288
+        batch_size = 8 * 64 * 1024
+        mbs = 64
+        val_inputs, val_targets = next(
+            distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+
+        model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
+        model.compile(dynamic=False)
+
+        train_steps = hparams["train_steps"]
+
+        # ---------- model init ----------
+        for name, p in model.named_parameters():
+            w = p.data
+            if name.endswith("weight"):
+                if "proj" in name:
+                    w.zero_()
+                elif "embed" in name:
+                    w.normal_()
+                else:
+                    w.normal_(std=0.33**0.5 / w.size(-1)**0.5)
+            elif name.endswith("bias"):
+                w.zero_()
+            elif name.endswith("gains"):
+                w.normal_(mean=1, std=0)
+            else:
+                raise Exception(f"Uninitialized parameter: {name}")
+
+        # ---------- optimizers ----------
+        optimizer1 = AdamW(
+            [dict(params=[model.embed.weight], lr=0.3),
+             dict(params=[model.proj.weight], lr=1/320),
+             dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
+            betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
+
+        block_params_2d = [p for p in model.blocks.parameters() if p.ndim >= 2]
+
+        if hparams["use_normuon"]:
+            optimizer2 = NorMuon(block_params_2d,
+                                 lr=hparams["lr"],
+                                 weight_decay=hparams["wd"],
+                                 mu=hparams["mu"],
+                                 beta2=hparams["normuon_beta2"])
+        else:
+            optimizer2 = Muon(block_params_2d,
+                              lr=hparams["lr"],
+                              weight_decay=hparams["wd"],
+                              mu=hparams["mu"])
+
+        # Populate param_names for diagnostics (full names include "blocks." prefix)
+        optimizer2.param_names = {
+            id(p): f"blocks.{name}"
+            for name, p in model.blocks.named_parameters()
+            if p.ndim >= 2
+        }
+
+        optimizers = [optimizer1, optimizer2]
+        assert set(p for opt in optimizers
+                   for group in opt.param_groups
+                   for p in group["params"]) == set(model.parameters())
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["initial_lr"] = group["lr"]
+
+        # ---------- LR schedule ----------
+        def set_hparams(step):
+            progress = step / train_steps
+            assert 0 <= progress < 1
+            cd = hparams["cooldown_frac"]
+            eta = 1.0 if progress < 1 - cd else (1 - progress) / cd
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["lr"] = group["initial_lr"] * eta
+
+        # ---------- diagnostics ----------
+        def log_diagnostics_fn(step):
+            if not hparams["log_diagnostics"]:
+                return
+            interval = int(hparams["diag_interval"])
+            if interval <= 0 or step % interval != 0:
+                return
+
+            patterns = hparams["diag_patterns"]
+            if isinstance(patterns, str):
+                patterns = (patterns,)
+            local_rows = optimizer2.diagnostic_stats(patterns)
+
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, local_rows)
+            if dist.get_rank() != 0:
+                return
+
+            rows = [row for rank_rows in gathered for row in rank_rows]
+            rows.sort(key=lambda r: r["name"])
+
+            for row in rows:
+                parts = [f"diag step:{step} name:{row['name']}"]
+                for k, v in row.items():
+                    if k == "name":
+                        continue
+                    parts.append(f"{k}:{v:.6g}")
+                print0(" ".join(parts), console=False)
+
+            if wandb_run is not None:
+                wandb_run.log(
+                    {f"diag/{row['name']}/{k}": v
+                     for row in rows for k, v in row.items()
+                     if k != "name" and not (isinstance(v, float) and math.isnan(v))},
+                    step=step)
+
+        # ---------- training loop ----------
+        train_loader = distributed_data_generator(
+            "data/fineweb10B/fineweb_train_*.bin", batch_size)
+        for p in model.parameters():
+            dist.broadcast(p.detach(), 0)
+
+        training_time = 0
+        last_val_step = 0
+        dist.barrier()
+        t0 = time.perf_counter()
+
+        for step in range(train_steps + 1):
+
+            # ---------- validation ----------
+            if step == train_steps or step % 125 == 0:
+                dist.barrier()
+                time_since_last_val = time.perf_counter() - t0
+                step_avg = (time_since_last_val / (step - last_val_step)
+                            if step > 0 else float("nan"))
+                last_val_step = step
+                training_time += time_since_last_val
+                model.eval()
+                val_loss = 0
+                with torch.no_grad():
+                    assert len(val_inputs) % mbs == 0
+                    for i in range(len(val_inputs) // mbs):
+                        val_loss += model(val_inputs[i*mbs:(i+1)*mbs],
+                                         val_targets[i*mbs:(i+1)*mbs])
+                dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+                val_loss /= val_tokens
+                print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f}"
+                       + f" train_time:{training_time:.3f}s"
+                       + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+                if wandb_run is not None:
+                    wandb_run.log(dict(
+                        val_loss=float(val_loss),
+                        train_time_s=training_time,
+                        step_avg_ms=1000 * step_avg if step > 0 else 0.0,
+                    ), step=step)
+                model.train()
+                dist.barrier()
+                t0 = time.perf_counter()
+
+            if step == train_steps:
+                break
+
+            # ---------- training step ----------
+            inputs, targets = next(train_loader)
+            assert len(inputs) % mbs == 0
+            for i in range(len(inputs) // mbs):
+                model(inputs[i*mbs:(i+1)*mbs],
+                      targets[i*mbs:(i+1)*mbs]).backward()
+            for name, p in model.named_parameters():
+                assert p.grad is not None, name
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+
+            set_hparams(step)
+            log_diagnostics_fn(step + 1)
+            for opt in optimizers:
+                opt.step()
+            model.zero_grad(set_to_none=True)
+
+            approx_training_time = training_time + (time.perf_counter() - t0)
+            print0(f"step:{step+1}/{train_steps}"
+                   + f" train_time:{approx_training_time:.3f}s"
+                   + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms",
+                   console=True, log=False)
+
+    finally:
+        if "wandb_run" in locals() and wandb_run is not None:
+            wandb_run.finish()
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

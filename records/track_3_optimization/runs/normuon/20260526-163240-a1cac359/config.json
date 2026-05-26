@@ -1,0 +1,20 @@
+{
+  "cooldown_frac": 0.7,
+  "diag_interval": 125,
+  "diag_patterns": [
+    "blocks.0.mlp.fc.weight",
+    "blocks.6.mlp.fc.weight",
+    "blocks.11.mlp.fc.weight",
+    "blocks.0.attn.q.weight"
+  ],
+  "log_diagnostics": true,
+  "lr": 0.025,
+  "mu": 0.95,
+  "normuon_beta2": 0.95,
+  "train_steps": 1500,
+  "use_normuon": false,
+  "wandb_mode": "online",
+  "wandb_project": "modded-nanogpt-track3",
+  "wandb_run_name": "normuon_muon_ctrl_1500",
+  "wd": 0.025
+}

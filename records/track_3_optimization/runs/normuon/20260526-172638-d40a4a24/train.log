@@ -1,0 +1,968 @@
+"""
+train_gpt_simple_normuon.py
+
+NorMuon optimizer experiment script with neuron-death diagnostics.
+Supports vanilla Muon (use_normuon=False) and NorMuon (use_normuon=True) via
+the same script for clean paired comparison.
+
+NorMuon adds per-row (per-neuron) adaptive step sizing after Newton-Schulz
+orthogonalization to prevent leverage-score concentration (neuron death):
+  Reference: records/track_3_optimization/results/20260503_normuon/
+  Theory: https://blog.tilderesearch.com/blog/aurora
+
+Diagnostics capture per-neuron update statistics every diag_interval steps
+to test the Aurora claim that Muon causes leverage-score concentration in MLP
+layers and that NorMuon mitigates it.
+"""
+
+import math
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read()  # read source ASAP for logging
+import argparse
+import ast
+import json
+import subprocess
+import uuid
+import time
+from datetime import datetime
+from pathlib import Path
+
+
+########################################
+#         Hparams & CLI Setup          #
+########################################
+
+BASE_HPARAMS = dict(
+    # Optimizer selection: True = NorMuon, False = vanilla Muon (control)
+    use_normuon     = True,
+    # Core optimizer
+    lr              = 0.025,
+    wd              = 0.025,
+    mu              = 0.95,
+    normuon_beta2   = 0.95,   # EMA decay for per-row variance (NorMuon only)
+    cooldown_frac   = 0.7,
+    train_steps     = 3375,
+    # Diagnostic logging
+    log_diagnostics = True,
+    diag_interval   = 125,
+    diag_patterns   = (
+        "blocks.0.mlp.fc.weight",    # MLP layer 0 — primary Aurora focus
+        "blocks.6.mlp.fc.weight",    # MLP layer 6
+        "blocks.11.mlp.fc.weight",   # MLP layer 11
+        "blocks.0.attn.q.weight",    # Attention (square, control)
+    ),
+    # wandb (off by default)
+    wandb_project   = None,
+    wandb_mode      = "online",
+    wandb_run_name  = None,
+)
+
+
+def parse_value(s):
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError):
+        return s
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--out-dir", type=Path, default=None)
+    return parser.parse_args()
+
+
+def resolve_hparams(overrides):
+    hparams = dict(BASE_HPARAMS)
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"--set expects KEY=VALUE, got {item!r}")
+        key, raw = item.split("=", 1)
+        hparams[key] = parse_value(raw)
+    return hparams
+
+
+def config_diff(hparams):
+    return {k: v for k, v in hparams.items() if BASE_HPARAMS.get(k) != v}
+
+
+def default_run_dir():
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path("records/track_3_optimization/runs/normuon") / f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def create_run_dir(out_dir=None):
+    run_dir = Path(out_dir) if out_dir is not None else default_run_dir()
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def git_commit():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return None
+
+
+def shard_counts():
+    cwd = Path.cwd()
+    return dict(
+        train_shards=len(list(cwd.glob("data/fineweb10B/fineweb_train_*.bin"))),
+        val_shards=len(list(cwd.glob("data/fineweb10B/fineweb_val_*.bin"))),
+    )
+
+
+def torch_versions():
+    m = globals().get("torch")
+    if m is None:
+        return None, None
+    return m.version.__version__, m.version.cuda
+
+
+def write_run_files(run_dir, args, hparams, mode, extra=None):
+    tv, cv = torch_versions()
+    diff = config_diff(hparams)
+    metadata = dict(
+        mode=mode,
+        argv=sys.argv,
+        cwd=str(Path.cwd()),
+        script=sys.argv[0],
+        dry_run=args.dry_run,
+        out_dir=str(run_dir),
+        git_commit=git_commit(),
+        torch_version=tv,
+        cuda_version=cv,
+        shard_counts=shard_counts(),
+    )
+    if extra:
+        metadata.update(extra)
+    (run_dir / "config.json").write_text(
+        json.dumps(hparams, indent=2, sort_keys=True, default=list) + "\n")
+    (run_dir / "config_diff.json").write_text(
+        json.dumps(diff, indent=2, sort_keys=True, default=list) + "\n")
+    (run_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True, default=list) + "\n")
+
+
+# Dry-run path: resolve config, write files, exit without CUDA.
+# IMPORTANT: never reuse a dry-run --out-dir for the real torchrun launch.
+# create_run_dir uses exist_ok=False; a leftover dry-run directory will cause
+# the real torchrun to fail after distributed init without writing train.log.
+if "--dry-run" in sys.argv:
+    args = parse_args()
+    hparams = resolve_hparams(args.set)
+    run_dir = create_run_dir(args.out_dir)
+    write_run_files(run_dir, args, hparams, "dry-run")
+    print(f"dry_run:true out_dir:{run_dir}")
+    print(json.dumps(
+        dict(hparams=hparams, config_diff=config_diff(hparams)),
+        indent=2, sort_keys=True, default=list))
+    sys.exit(0)
+
+import torch
+from torch import Tensor, nn
+from torch.optim import AdamW
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+########################################
+#              Dataloader              #
+########################################
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32)
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2])
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy())
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % dist.get_world_size() == 0
+    local_batch_size = batch_size // dist.get_world_size()
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        pos += batch_size
+        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
+
+
+########################################
+#             Architecture             #
+########################################
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        self.register_buffer("angular_freq", torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
+
+    def forward(self, x_BTHD: Tensor):
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
+        theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
+        cos, sin = theta.cos(), theta.sin()
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim=128):
+        super().__init__()
+        self.num_heads = dim // head_dim
+        self.head_dim = head_dim
+        hdim = self.num_heads * self.head_dim
+        self.q = Linear(dim, hdim)
+        self.k = Linear(dim, hdim)
+        self.v = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+        self.rotary = Rotary(head_dim)
+
+    def forward(self, x: Tensor):
+        B, T = x.size(0), x.size(1)
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        q, k = self.rotary(q), self.rotary(k)
+        y = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            scale=0.12, is_causal=True).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        return self.proj(y)
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.fc = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+
+    def forward(self, x: Tensor):
+        x = self.fc(x)
+        x = x.relu().square()
+        return self.proj(x)
+
+class Block(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim)
+        self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+    def forward(self, x: Tensor):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
+        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
+        self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
+
+    def forward(self, inputs: Tensor, targets: Tensor):
+        x = self.norm1(self.embed(inputs))
+        for block in self.blocks:
+            x = block(x)
+        logits = self.proj(self.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+
+
+########################################
+#              Optimizer               #
+########################################
+
+def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+    assert G.ndim >= 2
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    a, b, c = 2, -1.5, 0.5
+    for _ in range(12):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+def _zeropower_float32(G: Tensor) -> Tensor:
+    """NS in float32, uncompiled — used only in diagnostic_stats."""
+    assert G.ndim >= 2
+    X = G.float()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    a, b, c = 2.0, -1.5, 0.5
+    for _ in range(12):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+def _row_stats(x: Tensor, is_tall: bool):
+    """Per-neuron norms: row norms for tall matrices, col norms for wide."""
+    if is_tall:
+        return x.norm(dim=-1)   # shape [D1]
+    else:
+        return x.norm(dim=-2)   # shape [D2]  (per-column, Aurora's "neuron" dim for wide)
+
+
+def _cv(x: Tensor) -> float:
+    return (x.std() / x.mean().clamp_min(1e-12)).item()
+
+
+def _dead_frac(x: Tensor, threshold_frac: float = 0.1) -> float:
+    t = threshold_frac * x.mean().item()
+    return (x < t).float().mean().item()
+
+
+# ---------------------------------------------------------------------------
+# Vanilla Muon
+# ---------------------------------------------------------------------------
+
+@torch.compile
+def muon_update(grad, momentum, mu=0.95, nesterov=True):
+    momentum.lerp_(grad, 1 - mu)
+    update = grad.lerp_(momentum, mu) if nesterov else momentum
+    update = zeropower_via_newtonschulz5(update)
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return update
+
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+        assert isinstance(params, list) and len(params) >= 1
+        assert isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        super().__init__(params, defaults)
+        self.param_names = {}  # id(p) -> name, populated by caller
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum"] = torch.zeros_like(p)
+                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+    def diagnostic_stats(self, selected_patterns):
+        """Compute per-neuron neuron-death metrics for all matching params owned by this rank.
+
+        Returns a list of dicts (one per matched param). NorMuon-specific keys
+        (step_size_cv, step_size_max_min, cos_normuon_muon) are set to nan.
+        """
+        if isinstance(selected_patterns, str):
+            selected_patterns = (selected_patterns,)
+        selected_patterns = tuple(selected_patterns)
+
+        rows = []
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        with torch.no_grad():
+            for group in self.param_groups:
+                params = group["params"]
+                for base_i in range(0, len(params), world_size):
+                    if base_i + rank >= len(params):
+                        continue
+                    p = params[base_i + rank]
+                    name = self.param_names.get(id(p), f"param_{id(p)}")
+                    if selected_patterns and not any(pat in name for pat in selected_patterns):
+                        continue
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if not state:
+                        continue
+
+                    mu = group["mu"]
+                    is_tall = p.size(-2) >= p.size(-1)
+                    G = p.grad.float()
+                    W = p.data.float()
+                    momentum = state["momentum"].float()
+
+                    # Simulate Nesterov estimate without modifying state
+                    mom_new = momentum.lerp(G, 1 - mu)
+                    nesterov_est = G.lerp(mom_new, mu)
+
+                    # NS in float32 for clean diagnostics
+                    U_muon = _zeropower_float32(nesterov_est)
+                    U_muon = U_muon * max(1, G.size(-2) / G.size(-1))**0.5
+
+                    ns_norms = _row_stats(U_muon, is_tall)
+                    g_norms  = _row_stats(G, is_tall)
+                    w_norms  = _row_stats(W, is_tall)
+
+                    rel_update = (U_muon.norm() / W.norm().clamp_min(1e-12)).item()
+
+                    rows.append(dict(
+                        name=name,
+                        g_row_cv=_cv(g_norms),
+                        g_dead_frac=_dead_frac(g_norms),
+                        ns_row_cv=_cv(ns_norms),
+                        ns_dead_frac=_dead_frac(ns_norms),
+                        update_row_cv=_cv(ns_norms),    # for Muon, update ∝ NS output
+                        step_size_cv=float("nan"),       # NorMuon only
+                        step_size_max_min=float("nan"),  # NorMuon only
+                        cos_normuon_muon=float("nan"),   # NorMuon only
+                        w_row_cv=_cv(w_norms),
+                        w_dead_frac=_dead_frac(w_norms),
+                        rel_update=rel_update,
+                    ))
+
+        return rows
+
+
+# ---------------------------------------------------------------------------
+# NorMuon
+# ---------------------------------------------------------------------------
+
+@torch.compile
+def normuon_update(grad, momentum, second_momentum, mu=0.95, beta2=0.95, nesterov=True):
+    momentum.lerp_(grad, 1 - mu)
+    update = grad.lerp_(momentum, mu) if nesterov else momentum
+    update = zeropower_via_newtonschulz5(update)
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+
+    norm = update.norm(dim=(-2, -1), keepdim=True)
+    if grad.size(-2) >= grad.size(-1):
+        v_mean = torch.mean(update * update, dim=-1, keepdim=True)
+    else:
+        v_mean = torch.mean(update * update, dim=-2, keepdim=True)
+    second_momentum.lerp_(v_mean.float(), 1 - beta2)
+    step_size = second_momentum.clamp_min(1e-10).rsqrt().bfloat16()
+
+    update.mul_(step_size)
+    norm_new = update.norm(dim=(-2, -1), keepdim=True)
+    update.mul_(norm / norm_new.clamp_min(1e-10))
+
+    return update
+
+
+class NorMuon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, beta2=0.95):
+        assert isinstance(params, list) and len(params) >= 1
+        assert isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, beta2=beta2)
+        super().__init__(params, defaults)
+        self.param_names = {}  # id(p) -> name, populated by caller
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum"] = torch.zeros_like(p)
+                        if p.size(-2) >= p.size(-1):
+                            state["second_momentum"] = torch.zeros_like(p.data[..., 0:1])
+                        else:
+                            state["second_momentum"] = torch.zeros_like(p.data[0:1, ...])
+                    update = normuon_update(
+                        p.grad, state["momentum"], state["second_momentum"],
+                        mu=group["mu"], beta2=group["beta2"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+    def diagnostic_stats(self, selected_patterns):
+        """Compute per-neuron neuron-death + NorMuon-specific metrics.
+
+        Returns list of dicts. All diagnostics run in float32 on cloned state;
+        optimizer state is not modified. Diagnostic NS uses float32 (training
+        uses bfloat16) — distributions are qualitatively equivalent.
+        """
+        if isinstance(selected_patterns, str):
+            selected_patterns = (selected_patterns,)
+        selected_patterns = tuple(selected_patterns)
+
+        rows = []
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        with torch.no_grad():
+            for group in self.param_groups:
+                params = group["params"]
+                for base_i in range(0, len(params), world_size):
+                    if base_i + rank >= len(params):
+                        continue
+                    p = params[base_i + rank]
+                    name = self.param_names.get(id(p), f"param_{id(p)}")
+                    if selected_patterns and not any(pat in name for pat in selected_patterns):
+                        continue
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if not state:
+                        continue
+
+                    mu = group["mu"]
+                    beta2 = group["beta2"]
+                    is_tall = p.size(-2) >= p.size(-1)
+
+                    G = p.grad.float()
+                    W = p.data.float()
+                    momentum = state["momentum"].float()
+                    sec_mom = state["second_momentum"].float()  # [D1,1] or [1,D2]
+
+                    # Nesterov estimate (read-only clone)
+                    mom_new = momentum.lerp(G, 1 - mu)
+                    nesterov_est = G.lerp(mom_new, mu)
+
+                    # Muon update direction (float32 NS for clean diagnostics)
+                    U_muon = _zeropower_float32(nesterov_est)
+                    U_muon = U_muon * max(1, G.size(-2) / G.size(-1))**0.5
+
+                    # Per-row/col v_mean and projected step_size
+                    if is_tall:
+                        v_mean = (U_muon * U_muon).mean(dim=-1, keepdim=True)  # [D1,1]
+                    else:
+                        v_mean = (U_muon * U_muon).mean(dim=-2, keepdim=True)  # [1,D2]
+                    sec_mom_new = sec_mom.lerp(v_mean, 1 - beta2)
+                    step_size_2d = sec_mom_new.clamp_min(1e-10).rsqrt()  # [D1,1] or [1,D2]
+
+                    # NorMuon update direction
+                    U_normuon_pre = U_muon * step_size_2d  # broadcast
+                    norm_before = U_muon.norm()
+                    norm_after = U_normuon_pre.norm().clamp_min(1e-10)
+                    U_normuon = U_normuon_pre * (norm_before / norm_after)
+
+                    # Flatten step_size for scalar stats
+                    if is_tall:
+                        step_size_1d = step_size_2d.squeeze(-1)    # [D1]
+                    else:
+                        step_size_1d = step_size_2d.squeeze(-2)    # [D2]
+
+                    ns_norms     = _row_stats(U_muon, is_tall)
+                    nm_norms     = _row_stats(U_normuon, is_tall)
+                    g_norms      = _row_stats(G, is_tall)
+                    w_norms      = _row_stats(W, is_tall)
+
+                    cos_num   = (U_normuon.flatten() @ U_muon.flatten()).item()
+                    cos_denom = (U_normuon.norm() * U_muon.norm()).clamp_min(1e-12).item()
+                    cos_nm    = cos_num / cos_denom
+
+                    rel_update = (U_normuon.norm() / W.norm().clamp_min(1e-12)).item()
+
+                    ss_max = step_size_1d.max().item()
+                    ss_min = step_size_1d.clamp_min(1e-12).min().item()
+
+                    rows.append(dict(
+                        name=name,
+                        g_row_cv=_cv(g_norms),
+                        g_dead_frac=_dead_frac(g_norms),
+                        ns_row_cv=_cv(ns_norms),
+                        ns_dead_frac=_dead_frac(ns_norms),
+                        update_row_cv=_cv(nm_norms),
+                        step_size_cv=_cv(step_size_1d),
+                        step_size_max_min=ss_max / ss_min,
+                        cos_normuon_muon=cos_nm,
+                        w_row_cv=_cv(w_norms),
+                        w_dead_frac=_dead_frac(w_norms),
+                        rel_update=rel_update,
+                    ))
+
+        return rows
+
+
+########################################
+#                Main                  #
+########################################
+
+def main():
+    args = parse_args()
+    hparams = resolve_hparams(args.set)
+
+    # torchrun sets these env variables
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    dist.barrier()
+    assert 8 % dist.get_world_size() == 0
+
+    try:
+        if dist.get_rank() == 0:
+            run_dir = create_run_dir(args.out_dir)
+        else:
+            run_dir = None
+        run_dir_obj = [str(run_dir) if run_dir is not None else None]
+        dist.broadcast_object_list(run_dir_obj, src=0)
+        run_dir = Path(run_dir_obj[0])
+        logfile = run_dir / "train.log"
+
+        if dist.get_rank() == 0:
+            print(logfile)
+            write_run_files(run_dir, args, hparams, "train", dict(
+                device_name=torch.cuda.get_device_name(device),
+                world_size=dist.get_world_size(),
+            ))
+
+        wandb_run = None
+        if hparams["wandb_project"] is not None and dist.get_rank() == 0:
+            try:
+                import wandb
+                wandb_run = wandb.init(
+                    project=hparams["wandb_project"],
+                    mode=hparams.get("wandb_mode", "online"),
+                    name=hparams.get("wandb_run_name") or run_dir.name,
+                    dir=str(run_dir),
+                    config=hparams,
+                    tags=[Path(__file__).stem, f"world_size={dist.get_world_size()}"],
+                )
+            except Exception as e:
+                print(f"[wandb] init failed, continuing without wandb: {e}")
+                wandb_run = None
+
+        def print0(s, console=False, log=True):
+            if dist.get_rank() == 0:
+                if console:
+                    print(s)
+                if log:
+                    with open(logfile, "a") as f:
+                        print(s, file=f)
+
+        print0(code)
+        print0("=" * 100)
+        print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+               + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
+        print0(json.dumps(dict(hparams=hparams, config_diff=config_diff(hparams)),
+                          indent=2, sort_keys=True, default=list))
+        print0("=" * 100)
+
+        val_tokens = 20 * 524288
+        batch_size = 8 * 64 * 1024
+        mbs = 64
+        val_inputs, val_targets = next(
+            distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+
+        model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
+        model.compile(dynamic=False)
+
+        train_steps = hparams["train_steps"]
+
+        # ---------- model init ----------
+        for name, p in model.named_parameters():
+            w = p.data
+            if name.endswith("weight"):
+                if "proj" in name:
+                    w.zero_()
+                elif "embed" in name:
+                    w.normal_()
+                else:
+                    w.normal_(std=0.33**0.5 / w.size(-1)**0.5)
+            elif name.endswith("bias"):
+                w.zero_()
+            elif name.endswith("gains"):
+                w.normal_(mean=1, std=0)
+            else:
+                raise Exception(f"Uninitialized parameter: {name}")
+
+        # ---------- optimizers ----------
+        optimizer1 = AdamW(
+            [dict(params=[model.embed.weight], lr=0.3),
+             dict(params=[model.proj.weight], lr=1/320),
+             dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
+            betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
+
+        block_params_2d = [p for p in model.blocks.parameters() if p.ndim >= 2]
+
+        if hparams["use_normuon"]:
+            optimizer2 = NorMuon(block_params_2d,
+                                 lr=hparams["lr"],
+                                 weight_decay=hparams["wd"],
+                                 mu=hparams["mu"],
+                                 beta2=hparams["normuon_beta2"])
+        else:
+            optimizer2 = Muon(block_params_2d,
+                              lr=hparams["lr"],
+                              weight_decay=hparams["wd"],
+                              mu=hparams["mu"])
+
+        # Populate param_names for diagnostics (full names include "blocks." prefix)
+        optimizer2.param_names = {
+            id(p): f"blocks.{name}"
+            for name, p in model.blocks.named_parameters()
+            if p.ndim >= 2
+        }
+
+        optimizers = [optimizer1, optimizer2]
+        assert set(p for opt in optimizers
+                   for group in opt.param_groups
+                   for p in group["params"]) == set(model.parameters())
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["initial_lr"] = group["lr"]
+
+        # ---------- LR schedule ----------
+        def set_hparams(step):
+            progress = step / train_steps
+            assert 0 <= progress < 1
+            cd = hparams["cooldown_frac"]
+            eta = 1.0 if progress < 1 - cd else (1 - progress) / cd
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["lr"] = group["initial_lr"] * eta
+
+        # ---------- diagnostics ----------
+        def log_diagnostics_fn(step):
+            if not hparams["log_diagnostics"]:
+                return
+            interval = int(hparams["diag_interval"])
+            if interval <= 0 or step % interval != 0:
+                return
+
+            patterns = hparams["diag_patterns"]
+            if isinstance(patterns, str):
+                patterns = (patterns,)
+            local_rows = optimizer2.diagnostic_stats(patterns)
+
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, local_rows)
+            if dist.get_rank() != 0:
+                return
+
+            rows = [row for rank_rows in gathered for row in rank_rows]
+            rows.sort(key=lambda r: r["name"])
+
+            for row in rows:
+                parts = [f"diag step:{step} name:{row['name']}"]
+                for k, v in row.items():
+                    if k == "name":
+                        continue
+                    parts.append(f"{k}:{v:.6g}")
+                print0(" ".join(parts), console=False)
+
+            if wandb_run is not None:
+                wandb_run.log(
+                    {f"diag/{row['name']}/{k}": v
+                     for row in rows for k, v in row.items()
+                     if k != "name" and not (isinstance(v, float) and math.isnan(v))},
+                    step=step)
+
+        # ---------- training loop ----------
+        train_loader = distributed_data_generator(
+            "data/fineweb10B/fineweb_train_*.bin", batch_size)
+        for p in model.parameters():
+            dist.broadcast(p.detach(), 0)
+
+        training_time = 0
+        last_val_step = 0
+        dist.barrier()
+        t0 = time.perf_counter()
+
+        for step in range(train_steps + 1):
+
+            # ---------- validation ----------
+            if step == train_steps or step % 125 == 0:
+                dist.barrier()
+                time_since_last_val = time.perf_counter() - t0
+                step_avg = (time_since_last_val / (step - last_val_step)
+                            if step > 0 else float("nan"))
+                last_val_step = step
+                training_time += time_since_last_val
+                model.eval()
+                val_loss = 0
+                with torch.no_grad():
+                    assert len(val_inputs) % mbs == 0
+                    for i in range(len(val_inputs) // mbs):
+                        val_loss += model(val_inputs[i*mbs:(i+1)*mbs],
+                                         val_targets[i*mbs:(i+1)*mbs])
+                dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+                val_loss /= val_tokens
+                print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f}"
+                       + f" train_time:{training_time:.3f}s"
+                       + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+                if wandb_run is not None:
+                    wandb_run.log(dict(
+                        val_loss=float(val_loss),
+                        train_time_s=training_time,
+                        step_avg_ms=1000 * step_avg if step > 0 else 0.0,
+                    ), step=step)
+                model.train()
+                dist.barrier()
+                t0 = time.perf_counter()
+
+            if step == train_steps:
+                break
+
+            # ---------- training step ----------
+            inputs, targets = next(train_loader)
+            assert len(inputs) % mbs == 0
+            for i in range(len(inputs) // mbs):
+                model(inputs[i*mbs:(i+1)*mbs],
+                      targets[i*mbs:(i+1)*mbs]).backward()
+            for name, p in model.named_parameters():
+                assert p.grad is not None, name
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+
+            set_hparams(step)
+            log_diagnostics_fn(step + 1)
+            for opt in optimizers:
+                opt.step()
+            model.zero_grad(set_to_none=True)
+
+            approx_training_time = training_time + (time.perf_counter() - t0)
+            print0(f"step:{step+1}/{train_steps}"
+                   + f" train_time:{approx_training_time:.3f}s"
+                   + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms",
+                   console=True, log=False)
+
+    finally:
+        if "wandb_run" in locals() and wandb_run is not None:
+            wandb_run.finish()
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+Running PyTorch 2.11.0+cu128 compiled for CUDA 12.8 on NVIDIA H100 NVL with world_size 4
+{
+  "config_diff": {
+    "train_steps": 1500,
+    "wandb_project": "modded-nanogpt-track3",
+    "wandb_run_name": "normuon_nm_lr025_1500_v2"
+  },
+  "hparams": {
+    "cooldown_frac": 0.7,
+    "diag_interval": 125,
+    "diag_patterns": [
+      "blocks.0.mlp.fc.weight",
+      "blocks.6.mlp.fc.weight",
+      "blocks.11.mlp.fc.weight",
+      "blocks.0.attn.q.weight"
+    ],
+    "log_diagnostics": true,
+    "lr": 0.025,
+    "mu": 0.95,
+    "normuon_beta2": 0.95,
+    "train_steps": 1500,
+    "use_normuon": true,
+    "wandb_mode": "online",
+    "wandb_project": "modded-nanogpt-track3",
+    "wandb_run_name": "normuon_nm_lr025_1500_v2",
+    "wd": 0.025
+  }
+}
+====================================================================================================
+step:0/1500 val_loss:10.82584 train_time:0.001s step_avg:nanms
+diag step:125 name:blocks.0.attn.q.weight g_row_cv:0.477983 g_dead_frac:0 ns_row_cv:0.0041552 ns_dead_frac:0 update_row_cv:0.00340797 step_size_cv:0.00433578 step_size_max_min:1.02158 cos_normuon_muon:0.999991 w_row_cv:0.0530456 w_dead_frac:0 rel_update:0.898806
+diag step:125 name:blocks.0.mlp.fc.weight g_row_cv:0.641753 g_dead_frac:0 ns_row_cv:0.149616 ns_dead_frac:0 update_row_cv:0.064651 step_size_cv:0.161543 step_size_max_min:3.26891 cos_normuon_muon:0.98919 w_row_cv:0.0654142 w_dead_frac:0 rel_update:0.867858
+diag step:125 name:blocks.11.mlp.fc.weight g_row_cv:0.741862 g_dead_frac:0 ns_row_cv:0.256478 ns_dead_frac:0 update_row_cv:0.0785283 step_size_cv:0.306457 step_size_max_min:6.21939 cos_normuon_muon:0.966591 w_row_cv:0.0707142 w_dead_frac:0 rel_update:0.770799
+diag step:125 name:blocks.6.mlp.fc.weight g_row_cv:0.736853 g_dead_frac:0.00195312 ns_row_cv:0.265556 ns_dead_frac:0 update_row_cv:0.0937912 step_size_cv:0.360146 step_size_max_min:6.90759 cos_normuon_muon:0.964112 w_row_cv:0.058162 w_dead_frac:0 rel_update:0.762779
+step:125/1500 val_loss:4.58350 train_time:55.458s step_avg:443.66ms
+diag step:250 name:blocks.0.attn.q.weight g_row_cv:0.411597 g_dead_frac:0 ns_row_cv:0.00415463 ns_dead_frac:0 update_row_cv:0.00280978 step_size_cv:0.00298012 step_size_max_min:1.01979 cos_normuon_muon:0.999996 w_row_cv:0.0566795 w_dead_frac:0 rel_update:0.616594
+diag step:250 name:blocks.0.mlp.fc.weight g_row_cv:0.570077 g_dead_frac:0 ns_row_cv:0.123915 ns_dead_frac:0 update_row_cv:0.0495225 step_size_cv:0.113078 step_size_max_min:2.40203 cos_normuon_muon:0.993771 w_row_cv:0.0501636 w_dead_frac:0 rel_update:0.639205
+diag step:250 name:blocks.11.mlp.fc.weight g_row_cv:0.923729 g_dead_frac:0 ns_row_cv:0.180765 ns_dead_frac:0 update_row_cv:0.054775 step_size_cv:0.195531 step_size_max_min:3.72574 cos_normuon_muon:0.982784 w_row_cv:0.0471129 w_dead_frac:0 rel_update:0.541588
+diag step:250 name:blocks.6.mlp.fc.weight g_row_cv:0.709891 g_dead_frac:0 ns_row_cv:0.198981 ns_dead_frac:0 update_row_cv:0.0634452 step_size_cv:0.228148 step_size_max_min:4.90036 cos_normuon_muon:0.980978 w_row_cv:0.0434786 w_dead_frac:0 rel_update:0.540398
+step:250/1500 val_loss:4.08512 train_time:107.690s step_avg:417.86ms
+diag step:375 name:blocks.0.attn.q.weight g_row_cv:0.460385 g_dead_frac:0 ns_row_cv:0.00426452 ns_dead_frac:0 update_row_cv:0.00273444 step_size_cv:0.00323231 step_size_max_min:1.01945 cos_normuon_muon:0.999995 w_row_cv:0.058535 w_dead_frac:0 rel_update:0.517661
+diag step:375 name:blocks.0.mlp.fc.weight g_row_cv:0.556033 g_dead_frac:0 ns_row_cv:0.118893 ns_dead_frac:0 update_row_cv:0.0462787 step_size_cv:0.109864 step_size_max_min:2.33134 cos_normuon_muon:0.99403 w_row_cv:0.0494945 w_dead_frac:0 rel_update:0.535048
+diag step:375 name:blocks.11.mlp.fc.weight g_row_cv:1.3062 g_dead_frac:0 ns_row_cv:0.161278 ns_dead_frac:0 update_row_cv:0.0461704 step_size_cv:0.146424 step_size_max_min:3.12341 cos_normuon_muon:0.988241 w_row_cv:0.0477402 w_dead_frac:0 rel_update:0.451949
+diag step:375 name:blocks.6.mlp.fc.weight g_row_cv:0.750185 g_dead_frac:0 ns_row_cv:0.17815 ns_dead_frac:0 update_row_cv:0.0609916 step_size_cv:0.174678 step_size_max_min:3.5682 cos_normuon_muon:0.98631 w_row_cv:0.0408461 w_dead_frac:0 rel_update:0.45081
+step:375/1500 val_loss:3.91207 train_time:159.735s step_avg:416.36ms
+diag step:500 name:blocks.0.attn.q.weight g_row_cv:0.401496 g_dead_frac:0 ns_row_cv:0.00432877 ns_dead_frac:0 update_row_cv:0.00258872 step_size_cv:0.00328845 step_size_max_min:1.01818 cos_normuon_muon:0.999995 w_row_cv:0.0633648 w_dead_frac:0 rel_update:0.462131
+diag step:500 name:blocks.0.mlp.fc.weight g_row_cv:0.501342 g_dead_frac:0 ns_row_cv:0.118425 ns_dead_frac:0 update_row_cv:0.0433332 step_size_cv:0.108871 step_size_max_min:2.39094 cos_normuon_muon:0.994044 w_row_cv:0.0498281 w_dead_frac:0 rel_update:0.470896
+diag step:500 name:blocks.11.mlp.fc.weight g_row_cv:0.744146 g_dead_frac:0 ns_row_cv:0.149398 ns_dead_frac:0 update_row_cv:0.0415699 step_size_cv:0.132293 step_size_max_min:3.10669 cos_normuon_muon:0.989522 w_row_cv:0.0525607 w_dead_frac:0 rel_update:0.404039
+diag step:500 name:blocks.6.mlp.fc.weight g_row_cv:0.672939 g_dead_frac:0 ns_row_cv:0.163944 ns_dead_frac:0 update_row_cv:0.0558811 step_size_cv:0.15998 step_size_max_min:4.329 cos_normuon_muon:0.987867 w_row_cv:0.0425482 w_dead_frac:0 rel_update:0.402251
+step:500/1500 val_loss:3.80168 train_time:211.800s step_avg:416.51ms
+diag step:625 name:blocks.0.attn.q.weight g_row_cv:0.343281 g_dead_frac:0 ns_row_cv:0.00438499 ns_dead_frac:0 update_row_cv:0.00281107 step_size_cv:0.0034099 step_size_max_min:1.01763 cos_normuon_muon:0.999994 w_row_cv:0.0697383 w_dead_frac:0 rel_update:0.433904
+diag step:625 name:blocks.0.mlp.fc.weight g_row_cv:0.436614 g_dead_frac:0 ns_row_cv:0.116008 ns_dead_frac:0 update_row_cv:0.0390724 step_size_cv:0.108598 step_size_max_min:2.45235 cos_normuon_muon:0.994041 w_row_cv:0.0501633 w_dead_frac:0 rel_update:0.436328
+diag step:625 name:blocks.11.mlp.fc.weight g_row_cv:1.74909 g_dead_frac:0 ns_row_cv:0.146903 ns_dead_frac:0 update_row_cv:0.0378789 step_size_cv:0.126008 step_size_max_min:2.97489 cos_normuon_muon:0.989874 w_row_cv:0.0562671 w_dead_frac:0 rel_update:0.38043
+diag step:625 name:blocks.6.mlp.fc.weight g_row_cv:0.615132 g_dead_frac:0 ns_row_cv:0.156561 ns_dead_frac:0 update_row_cv:0.0497868 step_size_cv:0.149048 step_size_max_min:3.89413 cos_normuon_muon:0.988729 w_row_cv:0.0447136 w_dead_frac:0 rel_update:0.377825
+step:625/1500 val_loss:3.71597 train_time:263.825s step_avg:416.20ms
+diag step:750 name:blocks.0.attn.q.weight g_row_cv:0.333632 g_dead_frac:0 ns_row_cv:0.00381394 ns_dead_frac:0 update_row_cv:0.00263865 step_size_cv:0.00315858 step_size_max_min:1.01763 cos_normuon_muon:0.999995 w_row_cv:0.0760009 w_dead_frac:0 rel_update:0.420282
+diag step:750 name:blocks.0.mlp.fc.weight g_row_cv:0.464223 g_dead_frac:0 ns_row_cv:0.116496 ns_dead_frac:0 update_row_cv:0.0429589 step_size_cv:0.106297 step_size_max_min:2.40965 cos_normuon_muon:0.994242 w_row_cv:0.051266 w_dead_frac:0 rel_update:0.418439
+diag step:750 name:blocks.11.mlp.fc.weight g_row_cv:0.826847 g_dead_frac:0 ns_row_cv:0.148607 ns_dead_frac:0 update_row_cv:0.0414092 step_size_cv:0.123635 step_size_max_min:3.02866 cos_normuon_muon:0.990036 w_row_cv:0.0588587 w_dead_frac:0 rel_update:0.369416
+diag step:750 name:blocks.6.mlp.fc.weight g_row_cv:0.698157 g_dead_frac:0 ns_row_cv:0.158244 ns_dead_frac:0 update_row_cv:0.0544403 step_size_cv:0.143067 step_size_max_min:4.00256 cos_normuon_muon:0.989587 w_row_cv:0.0470061 w_dead_frac:0 rel_update:0.366371
+step:750/1500 val_loss:3.65368 train_time:315.816s step_avg:415.92ms
+diag step:875 name:blocks.0.attn.q.weight g_row_cv:0.383258 g_dead_frac:0 ns_row_cv:0.00418121 ns_dead_frac:0 update_row_cv:0.00269248 step_size_cv:0.00304962 step_size_max_min:1.01793 cos_normuon_muon:0.999995 w_row_cv:0.0826478 w_dead_frac:0 rel_update:0.413932
+diag step:875 name:blocks.0.mlp.fc.weight g_row_cv:0.427374 g_dead_frac:0 ns_row_cv:0.112978 ns_dead_frac:0 update_row_cv:0.038218 step_size_cv:0.103703 step_size_max_min:2.2874 cos_normuon_muon:0.994409 w_row_cv:0.0527915 w_dead_frac:0 rel_update:0.409648
+diag step:875 name:blocks.11.mlp.fc.weight g_row_cv:1.34078 g_dead_frac:0 ns_row_cv:0.146004 ns_dead_frac:0 update_row_cv:0.0349326 step_size_cv:0.120161 step_size_max_min:2.8073 cos_normuon_muon:0.990251 w_row_cv:0.0607493 w_dead_frac:0 rel_update:0.365057
+diag step:875 name:blocks.6.mlp.fc.weight g_row_cv:0.669483 g_dead_frac:0 ns_row_cv:0.15381 ns_dead_frac:0 update_row_cv:0.0491303 step_size_cv:0.14025 step_size_max_min:3.91488 cos_normuon_muon:0.989561 w_row_cv:0.0490495 w_dead_frac:0 rel_update:0.361685
+step:875/1500 val_loss:3.59941 train_time:367.831s step_avg:416.12ms
+diag step:1000 name:blocks.0.attn.q.weight g_row_cv:0.339732 g_dead_frac:0 ns_row_cv:0.00427884 ns_dead_frac:0 update_row_cv:0.002666 step_size_cv:0.00314401 step_size_max_min:1.01608 cos_normuon_muon:0.999995 w_row_cv:0.087596 w_dead_frac:0 rel_update:0.412388
+diag step:1000 name:blocks.0.mlp.fc.weight g_row_cv:0.367295 g_dead_frac:0 ns_row_cv:0.112985 ns_dead_frac:0 update_row_cv:0.0396433 step_size_cv:0.103204 step_size_max_min:2.46087 cos_normuon_muon:0.994476 w_row_cv:0.0537646 w_dead_frac:0 rel_update:0.406653
+diag step:1000 name:blocks.11.mlp.fc.weight g_row_cv:1.00702 g_dead_frac:0 ns_row_cv:0.142531 ns_dead_frac:0 update_row_cv:0.0350522 step_size_cv:0.117455 step_size_max_min:2.7625 cos_normuon_muon:0.990535 w_row_cv:0.0626258 w_dead_frac:0 rel_update:0.364703
+diag step:1000 name:blocks.6.mlp.fc.weight g_row_cv:0.568077 g_dead_frac:0 ns_row_cv:0.14766 ns_dead_frac:0 update_row_cv:0.0446577 step_size_cv:0.135518 step_size_max_min:3.51459 cos_normuon_muon:0.990051 w_row_cv:0.0509769 w_dead_frac:0 rel_update:0.361033
+step:1000/1500 val_loss:3.55168 train_time:419.881s step_avg:416.40ms
+diag step:1125 name:blocks.0.attn.q.weight g_row_cv:0.497194 g_dead_frac:0 ns_row_cv:0.00414166 ns_dead_frac:0 update_row_cv:0.00243715 step_size_cv:0.00309993 step_size_max_min:1.01628 cos_normuon_muon:0.999995 w_row_cv:0.0922957 w_dead_frac:0 rel_update:0.413942
+diag step:1125 name:blocks.0.mlp.fc.weight g_row_cv:0.417102 g_dead_frac:0 ns_row_cv:0.112166 ns_dead_frac:0 update_row_cv:0.0405835 step_size_cv:0.102901 step_size_max_min:2.38703 cos_normuon_muon:0.99448 w_row_cv:0.054528 w_dead_frac:0 rel_update:0.407142
+diag step:1125 name:blocks.11.mlp.fc.weight g_row_cv:1.24634 g_dead_frac:0 ns_row_cv:0.143378 ns_dead_frac:0 update_row_cv:0.036461 step_size_cv:0.115752 step_size_max_min:2.6017 cos_normuon_muon:0.990618 w_row_cv:0.0639566 w_dead_frac:0 rel_update:0.36682
+diag step:1125 name:blocks.6.mlp.fc.weight g_row_cv:0.517562 g_dead_frac:0 ns_row_cv:0.147503 ns_dead_frac:0 update_row_cv:0.0440917 step_size_cv:0.131958 step_size_max_min:3.26029 cos_normuon_muon:0.990336 w_row_cv:0.0523502 w_dead_frac:0 rel_update:0.362982
+step:1125/1500 val_loss:3.51160 train_time:471.883s step_avg:416.01ms
+diag step:1250 name:blocks.0.attn.q.weight g_row_cv:0.302799 g_dead_frac:0 ns_row_cv:0.00395679 ns_dead_frac:0 update_row_cv:0.00240742 step_size_cv:0.00313363 step_size_max_min:1.01491 cos_normuon_muon:0.999995 w_row_cv:0.0958662 w_dead_frac:0 rel_update:0.417583
+diag step:1250 name:blocks.0.mlp.fc.weight g_row_cv:0.293468 g_dead_frac:0 ns_row_cv:0.111634 ns_dead_frac:0 update_row_cv:0.0376157 step_size_cv:0.101615 step_size_max_min:2.31415 cos_normuon_muon:0.994612 w_row_cv:0.0552779 w_dead_frac:0 rel_update:0.409462
+diag step:1250 name:blocks.11.mlp.fc.weight g_row_cv:0.886519 g_dead_frac:0 ns_row_cv:0.140864 ns_dead_frac:0 update_row_cv:0.0314943 step_size_cv:0.113452 step_size_max_min:2.65494 cos_normuon_muon:0.990834 w_row_cv:0.0650189 w_dead_frac:0 rel_update:0.37001
+diag step:1250 name:blocks.6.mlp.fc.weight g_row_cv:0.466635 g_dead_frac:0 ns_row_cv:0.14503 ns_dead_frac:0 update_row_cv:0.0390345 step_size_cv:0.128973 step_size_max_min:3.06826 cos_normuon_muon:0.990651 w_row_cv:0.053473 w_dead_frac:0 rel_update:0.366073
+step:1250/1500 val_loss:3.47395 train_time:523.923s step_avg:416.32ms
+diag step:1375 name:blocks.0.attn.q.weight g_row_cv:0.301355 g_dead_frac:0 ns_row_cv:0.00409949 ns_dead_frac:0 update_row_cv:0.00250713 step_size_cv:0.00324021 step_size_max_min:1.01759 cos_normuon_muon:0.999995 w_row_cv:0.0983245 w_dead_frac:0 rel_update:0.420627
+diag step:1375 name:blocks.0.mlp.fc.weight g_row_cv:0.275459 g_dead_frac:0 ns_row_cv:0.113578 ns_dead_frac:0 update_row_cv:0.0378763 step_size_cv:0.101884 step_size_max_min:2.51577 cos_normuon_muon:0.994554 w_row_cv:0.055972 w_dead_frac:0 rel_update:0.411987
+diag step:1375 name:blocks.11.mlp.fc.weight g_row_cv:0.562545 g_dead_frac:0 ns_row_cv:0.140477 ns_dead_frac:0 update_row_cv:0.031942 step_size_cv:0.114162 step_size_max_min:2.67175 cos_normuon_muon:0.990703 w_row_cv:0.0656758 w_dead_frac:0 rel_update:0.373001
+diag step:1375 name:blocks.6.mlp.fc.weight g_row_cv:0.418536 g_dead_frac:0 ns_row_cv:0.142246 ns_dead_frac:0 update_row_cv:0.0391925 step_size_cv:0.127583 step_size_max_min:3.21871 cos_normuon_muon:0.990741 w_row_cv:0.0542472 w_dead_frac:0 rel_update:0.368968
+step:1375/1500 val_loss:3.44385 train_time:575.933s step_avg:416.08ms
+diag step:1500 name:blocks.0.attn.q.weight g_row_cv:0.295377 g_dead_frac:0 ns_row_cv:0.00402758 ns_dead_frac:0 update_row_cv:0.00248075 step_size_cv:0.00346631 step_size_max_min:1.01684 cos_normuon_muon:0.999994 w_row_cv:0.0993638 w_dead_frac:0 rel_update:0.422021
+diag step:1500 name:blocks.0.mlp.fc.weight g_row_cv:0.263468 g_dead_frac:0 ns_row_cv:0.113418 ns_dead_frac:0 update_row_cv:0.0361334 step_size_cv:0.104292 step_size_max_min:2.67314 cos_normuon_muon:0.994326 w_row_cv:0.0562201 w_dead_frac:0 rel_update:0.413292
+diag step:1500 name:blocks.11.mlp.fc.weight g_row_cv:0.770281 g_dead_frac:0 ns_row_cv:0.143616 ns_dead_frac:0 update_row_cv:0.0299018 step_size_cv:0.114969 step_size_max_min:2.61608 cos_normuon_muon:0.990436 w_row_cv:0.0658926 w_dead_frac:0 rel_update:0.37437
+diag step:1500 name:blocks.6.mlp.fc.weight g_row_cv:0.434687 g_dead_frac:0 ns_row_cv:0.146843 ns_dead_frac:0 update_row_cv:0.0376191 step_size_cv:0.129979 step_size_max_min:2.86266 cos_normuon_muon:0.990422 w_row_cv:0.0544268 w_dead_frac:0 rel_update:0.370312
+step:1500/1500 val_loss:3.42511 train_time:627.898s step_avg:415.71ms
