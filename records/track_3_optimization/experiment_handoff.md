@@ -829,6 +829,42 @@ Neither Muon nor NorMuon showed neuron death (`w_dead_frac = 0.000`) at any trac
 
 5. **No neuron death at 1500 steps** in either optimizer with this architecture and hyperparameters. The precondition for death (heterogeneous row norms after NS) is confirmed present in Muon.
 
+### Leon `side=input` Aurora Diagnostic (2026-05-27)
+
+Two 1500-step screens added `leon_precondition_side` to the Leon script (`"auto"` / `"input"` / `"output"`), added `update_row_cv` / `update_l0_row_cv` / `w_dead_frac` to Leon diagnostics, and ran `side=input` vs `side=auto` as matched controls (lr=0.025, wd=0.025, mu=0.95, ns=12, float32, eps=1e-12, cd=0.7).
+
+**`side=input` geometry reminder:** For tall MLP fc (3072×768), `input` forces 768×768 Gram (same as `auto`). For wide MLP proj (768×3072), `input` forces 3072×3072 right-side Gram instead of `auto`'s 768×768 left-side Gram. The difference is entirely on wide layers.
+
+| Run | `precondition_side` | Final val@1500 | Step avg | Run dir |
+|---|---|---:|---:|---|
+| `leon_side_auto_1500` | auto | 3.43211 | 610ms | `runs/leon/20260526-234305-79475608` |
+| **`leon_side_input_1500`** | **input** | **3.42710** | 862ms | `runs/leon/20260526-232033-b3f769f4` |
+
+`side=input` wins by −0.005 but costs +41% step time (the 3072×3072 NS on mlp.proj).
+
+**update_row_cv comparison (`blocks.0.mlp.fc.weight` — tall, Aurora primary target):**
+
+| Step | leon_auto | leon_input | NorMuon lr=0.025 |
+|---:|---:|---:|---:|
+| 125 | 0.332 | 0.224 | **0.065** |
+| 500 | 0.163 | 0.116 | **0.043** |
+| 1000 | 0.141 | 0.104 | **0.040** |
+| 1500 | 0.141 | 0.106 | **0.036** |
+
+**Key findings:**
+
+1. **`side=input` reduces mlp.fc `update_row_cv` by ~30% vs auto, but remains ~3× worse than NorMuon.** The improvement is indirect (changed model trajectory from differently-updated wide layers), not from a geometric change to mlp.fc's own update — because for tall matrices `side=input` ≡ `side=auto`.
+
+2. **`side=input` is the direct geometric change for mlp.proj (wide, 768×3072):** `update_row_cv` drops from 0.307→0.159 (auto) to 0.125→0.085 (input), a ~59% reduction. This is where the 3072×3072 large-side Gram operates directly on the column dimension that `update_row_cv` measures.
+
+3. **Leon's L term consistently ADDS row-norm heterogeneity for tall layers**, not reduces it. For mlp.fc with `side=auto`: full-L cv = 0.332 vs L=0 cv = 0.304 (+0.027). With `side=input`: +0.019. The Gram preconditioning in the column space rotates update energy between input features — this has no direct relationship to row norms and can make them more heterogeneous.
+
+4. **Exception: `side=input` mlp.proj, L HELPS** (full-L cv = 0.125 vs L=0 cv = 0.229, delta = −0.104). With 3072×3072 right preconditioning, the historical column-covariance EMA actively suppresses dominant directions, equalizing column norms. This is the only case where Leon's L achieves Aurora-style equalization.
+
+5. **attn.q (square 768×768): L=0 has near-zero cv (~0.003–0.005) but full-L has cv ~0.07–0.08.** Leon's L term significantly increases row heterogeneity for attention layers in both sides. The square Gram captures the full column covariance, and its EMA-weighted preconditioning rotates the isotropic NS output into an anisotropic direction.
+
+6. **NorMuon's equalization is structurally orthogonal to Leon's Gram preconditioning.** The Gram EMA operates in input/output feature space (column/row basis); NorMuon's per-row scaling operates in the neuron (row) basis post-NS. A hybrid LeonNorMuon combining both could potentially add NorMuon's equalization on top of Leon's directional preconditioning.
+
 ### Next Steps for NorMuon
 
 1. **3375-step benchmark run at lr=0.035** — expected to be NorMuon's best config per the reference implementation. The 1500-step margin (-0.007) is small but consistent; a full-budget run would determine whether NorMuon closes the gap to Muon at 3375 steps.
